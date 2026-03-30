@@ -1,45 +1,58 @@
 use rand::CryptoRng;
 use std::cmp::min;
+use std::convert::From;
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::UdpSocket;
 
-use crate::packets::{ControlChannelPacket, Opcode, Packet};
+use crate::packets::{ControlChannelPacket, Opcode, Packet, PacketError};
 
 #[derive(Debug)]
-pub struct ControlChannelError {
-    message: &'static str,
-    cause: Option<Box<dyn Error>>,
+pub enum ControlChannelError {
+    Io(io::Error),
+    MalformedPacket(PacketError),
+    Other(&'static str),
 }
 
 impl fmt::Display for ControlChannelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(cause) = &self.cause {
-            write!(
-                formatter,
-                "Control channel error: {}; cause: {}",
-                self.message, cause
-            )?;
-        } else {
-            write!(formatter, "Control channel error: {}", self.message)?;
+        match self {
+            Self::Io(e) => write!(formatter, "Control channel IO Error: {}", e)?,
+            Self::MalformedPacket(e) => {
+                write!(formatter, "Malformed packet in control channel: {}", e)?
+            }
+            Self::Other(message) => write!(formatter, "Control channel error: {}", message)?,
         }
         Result::Ok(())
+    }
+}
+
+impl From<io::Error> for ControlChannelError {
+    fn from(e: io::Error) -> Self {
+        ControlChannelError::Io(e)
+    }
+}
+
+impl From<PacketError> for ControlChannelError {
+    fn from(e: PacketError) -> Self {
+        ControlChannelError::MalformedPacket(e)
     }
 }
 
 impl Error for ControlChannelError {}
 
 impl ControlChannelError {
-    pub fn source(&self) -> Option<&dyn Error> {
-        self.cause.as_ref().map(|boxed_error| &**boxed_error)
+    pub fn with_message(message: &'static str) -> Self {
+        ControlChannelError::Other(message)
     }
 
-    pub fn with_message(message: &'static str) -> Self {
-        ControlChannelError {
-            message,
-            cause: None,
+    pub fn would_block(&self) -> bool {
+        if let Self::Io(e) = self {
+            e.kind() == io::ErrorKind::WouldBlock
+        } else {
+            false
         }
     }
 }
@@ -128,7 +141,6 @@ impl ControlChannel {
             packet_id = Some(self.next_packet_id);
             self.next_packet_id += 1;
         }
-        println!("{:?}", packet_id);
 
         let acks = if self.peer_session_id.is_none() {
             Vec::<u32>::new()
@@ -142,11 +154,6 @@ impl ControlChannel {
         } else {
             None
         };
-        println!("{:?}", self.session_id);
-
-        if opcode == Opcode::ControlV1 {
-            println!("acks: {:?}, peer session id: {:?}", acks, peer_session_id);
-        }
 
         ControlChannelPacket {
             opcode,
@@ -161,7 +168,7 @@ impl ControlChannel {
 
     pub fn send_packet(&mut self, opcode: Opcode, payload: &[u8]) -> io::Result<usize> {
         let packet = self.make_packet(opcode, payload);
-        let mut send_buffer: [u8; 2000] = [0; 2000];
+        let mut send_buffer: [u8; 3000] = [0; 3000];
         let length = packet.to_buffer(&mut send_buffer).unwrap();
         self.socket.send(&send_buffer[..length])
     }
@@ -185,6 +192,19 @@ impl ControlChannel {
 
     fn receive_packet<'a>(
         &mut self,
+        buffer: &'a mut [u8],
+    ) -> Result<Message<'a>, ControlChannelError> {
+        let length = self.socket.recv(buffer)?;
+        let packet = Packet::parse(&buffer[..length])?;
+        if let Packet::Control(p) = packet {
+            self.process_packet(&p)
+        } else {
+            panic!("at the disco");
+        }
+    }
+
+    fn process_packet<'a>(
+        &mut self,
         packet: &ControlChannelPacket<'a>,
     ) -> Result<Message<'a>, ControlChannelError> {
         if let Some(peer_session_id) = self.peer_session_id {
@@ -198,10 +218,6 @@ impl ControlChannel {
         if let Some(packet_id) = packet.packet_id {
             self.add_unacked_id(packet_id);
         }
-        println!(
-            "last seen {:?}",
-            &self.last_seen_packet_ids[..self.num_last_seen_packet_ids]
-        );
 
         if self.state == State::PendingReset && packet.opcode == Opcode::ControlHardResetServerV2 {
             self.state = State::Initialized;
@@ -214,7 +230,100 @@ impl ControlChannel {
     }
 }
 
-impl io::Read for ControlChannel {
+struct TlsRecord<'a> {
+    length: usize,
+    record_data: &'a [u8],
+}
+
+impl<'a> TlsRecord<'a> {
+    const HEADER_SIZE: usize = 5;
+}
+
+pub struct TlsRecordStream<'a> {
+    read_buffer: Vec<u8>,
+    write_buffer: Vec<u8>,
+    packet_channel: &'a mut ControlChannel,
+}
+
+impl<'a> TlsRecordStream<'a> {
+    pub fn new(packet_channel: &'a mut ControlChannel) -> Self {
+        TlsRecordStream {
+            read_buffer: Vec::new(),
+            write_buffer: Vec::new(),
+            packet_channel,
+        }
+    }
+}
+
+impl<'a> Read for TlsRecordStream<'a> {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        if self.read_buffer.len() > 0 {
+            let num_bytes = min(target.len(), self.read_buffer.len());
+            target[..num_bytes].copy_from_slice(&self.read_buffer[..num_bytes]);
+
+            // Remove the bytes that we just copied from the read buffer.
+            self.read_buffer.copy_within(num_bytes.., 0);
+            let remaining_bytes = self.read_buffer.len() - num_bytes;
+            self.read_buffer.truncate(remaining_bytes);
+            Ok(num_bytes)
+        } else {
+            let mut receive_buffer: [u8; 3000] = [0; 3000];
+            let message = match self.packet_channel.receive_packet(&mut receive_buffer) {
+                Ok(message) => message,
+                Err(ControlChannelError::Io(e)) => {
+                    if (e.kind() == io::ErrorKind::WouldBlock) {
+                        return Ok(0);
+                    }
+                    return Err(e);
+                }
+                _ => panic!("at the disco"),
+            };
+            if message.opcode == Opcode::ControlV1 {
+                let num_bytes = min(message.payload.len(), target.len());
+                target[..num_bytes].copy_from_slice(&message.payload[..num_bytes]);
+                self.read_buffer = message.payload[num_bytes..].to_vec();
+                Ok(num_bytes)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+}
+
+impl<'a> Write for TlsRecordStream<'a> {
+    fn write(&mut self, source: &[u8]) -> io::Result<usize> {
+        println!("SSL wants to write {} bytes", source.len());
+        self.write_buffer.extend(source);
+        let mut remaining_write_buffer: &mut [u8] = self.write_buffer.as_mut_slice();
+        let mut tls_record: &mut [u8];
+        let mut payload_bytes_sent: usize = 0;
+        while remaining_write_buffer.len() > TlsRecord::HEADER_SIZE {
+            let record_length =
+                u16::from_be_bytes([remaining_write_buffer[3], remaining_write_buffer[4]]) as usize;
+            if remaining_write_buffer.len() >= TlsRecord::HEADER_SIZE + record_length as usize {
+                (tls_record, remaining_write_buffer) =
+                    remaining_write_buffer.split_at_mut(TlsRecord::HEADER_SIZE + record_length);
+                self.packet_channel
+                    .send_packet(Opcode::ControlV1, tls_record)?;
+                payload_bytes_sent += tls_record.len();
+            } else {
+                break;
+            }
+        }
+        self.write_buffer.copy_within(payload_bytes_sent.., 0);
+        self.write_buffer
+            .truncate(self.write_buffer.len() - payload_bytes_sent);
+        Ok(source.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.packet_channel
+            .send_packet(Opcode::ControlV1, &self.write_buffer)
+            .map(|_| ())
+    }
+}
+
+impl Read for ControlChannel {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let mut receive_buffer: [u8; 2000] = [0; 2000];
 
@@ -223,12 +332,10 @@ impl io::Read for ControlChannel {
             if length == 0 {
                 return Ok(0);
             }
-            println!("read length {}", length);
 
             let packet = Packet::parse(&receive_buffer[..length]).unwrap();
             if let Packet::Control(p) = packet {
-                let message = self.receive_packet(&p).unwrap();
-                println!("received opcode {:?}", message.opcode);
+                let message = self.process_packet(&p).unwrap();
                 if message.opcode == Opcode::ControlV1 {
                     buffer[0..message.payload.len()].copy_from_slice(message.payload);
                     return Ok(message.payload.len());
@@ -240,7 +347,7 @@ impl io::Read for ControlChannel {
     }
 }
 
-impl io::Write for ControlChannel {
+impl Write for ControlChannel {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         /*
         if data.len() >= 5 {

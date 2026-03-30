@@ -63,7 +63,7 @@ impl TryFrom<u8> for Opcode {
 }
 
 impl Opcode {
-    fn get_type(&self) -> OpcodeType {
+    pub fn get_type(&self) -> OpcodeType {
         match *self {
             Opcode::ControlV1 => OpcodeType::Control,
             Opcode::ControlAckV1 => OpcodeType::Control,
@@ -177,12 +177,16 @@ impl<'a> ControlChannelPacket<'a> {
     }
 }
 
-pub struct DataChannelPacket {}
+pub struct DataChannelPacket<'a> {
+    opcode: Opcode,
+    session_id: u64,
+    payload: &'a [u8],
+}
 
 /// OpenVPN UDP packet.
 pub enum Packet<'a> {
     Control(ControlChannelPacket<'a>),
-    Data(DataChannelPacket),
+    Data(DataChannelPacket<'a>),
 }
 
 impl<'a> Packet<'a> {
@@ -260,6 +264,34 @@ impl<'a> Packet<'a> {
         match self {
             Self::Control(control_packet) => control_packet.to_buffer(buffer),
             Self::Data(_) => panic!("Not implemented"),
+        }
+    }
+
+    pub fn get_opcode(&self) -> Opcode {
+        match self {
+            Self::Control(p) => p.opcode,
+            Self::Data(p) => p.opcode,
+        }
+    }
+
+    pub fn get_session_id(&self) -> u64 {
+        match self {
+            Self::Control(p) => p.session_id,
+            Self::Data(p) => p.session_id,
+        }
+    }
+
+    pub fn get_packet_id(&self) -> Option<u32> {
+        match self {
+            Self::Control(p) => p.packet_id,
+            Self::Data(p) => None,
+        }
+    }
+
+    pub fn get_payload(&self) -> &'a [u8] {
+        match self {
+            Self::Control(p) => p.payload,
+            Self::Data(p) => p.payload,
         }
     }
 }
