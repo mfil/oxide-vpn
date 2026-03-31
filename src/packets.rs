@@ -281,6 +281,13 @@ impl<'a> Packet<'a> {
         }
     }
 
+    pub fn get_acks(&self) -> &[u32] {
+        match self {
+            Self::Control(p) => &p.acks,
+            Self::Data(_) => &[],
+        }
+    }
+
     pub fn get_packet_id(&self) -> Option<u32> {
         match self {
             Self::Control(p) => p.packet_id,
