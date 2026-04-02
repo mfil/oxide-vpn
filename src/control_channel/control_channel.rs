@@ -1,4 +1,3 @@
-use rand::CryptoRng;
 use std::cmp::min;
 use std::convert::From;
 use std::error::Error;
@@ -6,11 +5,21 @@ use std::fmt;
 use std::io;
 use std::io::{Read, Write};
 use std::mem::swap;
-use std::net::UdpSocket;
+use std::sync::mpsc::{Receiver, Sender};
+
+use rand::CryptoRng;
+
+use openssl;
+use openssl::pkey::{PKey, Private};
+use openssl::ssl::{
+    HandshakeError, MidHandshakeSslStream, SslAcceptor, SslAcceptorBuilder, SslConnector,
+    SslMethod, SslStream, SslVerifyMode, SslVersion,
+};
+use openssl::x509::X509;
 
 use super::control_channel_state::ControlChannelState;
 
-use crate::packets::{ControlChannelPacket, Opcode, Packet, PacketError};
+use crate::packets::{ControlChannelPacket, Opcode, PacketError};
 
 #[derive(Debug)]
 pub enum ControlChannelError {
@@ -90,8 +99,12 @@ impl TlsRecordStream {
         out
     }
 
-    pub fn insert_payload(&mut self, payload: &[u8]) {
-        self.payloads_to_read.extend_from_slice(payload);
+    pub fn insert_payload(&mut self, payload: Vec<u8>) {
+        if self.payloads_to_read.is_empty() {
+            self.payloads_to_read = payload;
+        } else {
+            self.payloads_to_read.extend_from_slice(&payload);
+        }
     }
 }
 
@@ -159,77 +172,269 @@ impl Write for TlsRecordStream {
     }
 }
 
+#[derive(Debug)]
+enum TlsSession {
+    Uninitialized,
+    Handshake(MidHandshakeSslStream<TlsRecordStream>),
+    Connected(SslStream<TlsRecordStream>),
+}
+
+impl TlsSession {
+    pub fn is_uninitialized(&self) -> bool {
+        if let Self::Uninitialized = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_handshake(&self) -> bool {
+        if let Self::Handshake(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        if let Self::Connected(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_tls_record_stream(&mut self) -> Option<&mut TlsRecordStream> {
+        match self {
+            Self::Uninitialized => None,
+            Self::Handshake(stream) => Some(stream.get_mut()),
+            Self::Connected(stream) => Some(stream.get_mut()),
+        }
+    }
+
+    pub fn get_stream(&mut self) -> Option<&mut SslStream<TlsRecordStream>> {
+        if let Self::Connected(ssl_stream) = self {
+            Some(ssl_stream)
+        } else {
+            None
+        }
+    }
+
+    fn take(&mut self) -> Self {
+        let mut out = Self::Uninitialized;
+        swap(&mut out, self);
+        out
+    }
+
+    pub fn insert_payload(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Result<(), HandshakeError<TlsRecordStream>> {
+        let session = self.take();
+
+        if let TlsSession::Handshake(mut stream) = session {
+            stream.get_mut().insert_payload(payload);
+            match stream.handshake() {
+                Ok(stream) => {
+                    *self = TlsSession::Connected(stream);
+                    println!("Handshake done");
+                }
+                Err(HandshakeError::WouldBlock(stream)) => *self = TlsSession::Handshake(stream),
+                Err(e) => return Err(e),
+            };
+        } else if let TlsSession::Connected(mut stream) = session {
+            stream.get_mut().insert_payload(payload);
+            *self = TlsSession::Connected(stream);
+        }
+        Ok(())
+    }
+}
+
 /// OpenVPN Control Channel.
 #[derive(Debug)]
 pub struct ControlChannel {
     state: ControlChannelState,
-    record_stream: TlsRecordStream,
+    is_server: bool,
+    tls_session: TlsSession,
+    ca: X509,
+    certificate: X509,
+    private_key: PKey<Private>,
+    receiver: Receiver<ControlChannelPacket>,
+    sender: Sender<ControlChannelPacket>,
 }
 
 impl ControlChannel {
     /// Create new control channel.
-    pub fn new<T: CryptoRng>(rng: &mut T) -> Self {
+    pub fn new<R: CryptoRng>(
+        rng: &mut R,
+        is_server: bool,
+        ca: X509,
+        certificate: X509,
+        private_key: PKey<Private>,
+        receiver: Receiver<ControlChannelPacket>,
+        sender: Sender<ControlChannelPacket>,
+    ) -> Self {
         ControlChannel {
             state: ControlChannelState::new(rng.next_u64()),
-            record_stream: TlsRecordStream::new(),
+            is_server,
+            tls_session: TlsSession::Uninitialized,
+            ca,
+            certificate,
+            private_key,
+            receiver,
+            sender,
         }
     }
 
-    pub fn receive_packet(&mut self, packet: ControlChannelPacket) {
-        self.state.process_packet(&packet);
-        match packet.opcode {
-            Opcode::ControlV1 => self.record_stream.insert_payload(&packet.payload),
-            Opcode::ControlAckV1 => (), // Nothing to do.
-            _ => panic!("foo"),
+    fn is_connected(&self) -> bool {
+        self.tls_session.is_connected()
+    }
+
+    fn begin_tls_handshake_client(&mut self) -> Result<(), HandshakeError<TlsRecordStream>> {
+        // TODO: Do actual cert verification.
+        let mut connector_builder = SslConnector::builder(SslMethod::tls())?;
+        connector_builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        connector_builder.set_verify(SslVerifyMode::NONE);
+        connector_builder.set_certificate(&self.certificate);
+        connector_builder.set_private_key(&self.private_key);
+        let connector = connector_builder.build();
+        let record_stream = TlsRecordStream::new();
+
+        match connector.connect("Control Channel", record_stream) {
+            Ok(stream) => self.tls_session = TlsSession::Connected(stream),
+            Err(HandshakeError::WouldBlock(stream)) => {
+                self.tls_session = TlsSession::Handshake(stream)
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(())
+    }
+
+    fn begin_tls_handshake_server(&mut self) -> Result<(), HandshakeError<TlsRecordStream>> {
+        // TODO: Do actual cert verification.
+        let mut acceptor_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+        acceptor_builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        acceptor_builder.set_verify(SslVerifyMode::NONE);
+        acceptor_builder.set_certificate(&self.certificate);
+        acceptor_builder.set_private_key(&self.private_key);
+        let acceptor = acceptor_builder.build();
+        let record_stream = TlsRecordStream::new();
+
+        match acceptor.accept(record_stream) {
+            Ok(stream) => self.tls_session = TlsSession::Connected(stream),
+            Err(HandshakeError::WouldBlock(stream)) => {
+                self.tls_session = TlsSession::Handshake(stream)
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(())
+    }
+
+    /// (Re-)initialize the control channel.
+    pub fn reset(&mut self) {
+        if !self.is_server {
+            let packet = self
+                .state
+                .make_packet(Opcode::ControlHardResetClientV2, Vec::new());
+            self.sender.send(packet).unwrap();
+            self.tls_session = TlsSession::Uninitialized;
+        }
+    }
+
+    pub fn receive_packets(&mut self) {
+        while let Ok(packet) = self.receiver.try_recv() {
+            // TODO: Need to handle out of order packets.
+            self.state.process_packet(&packet);
+
+            // Insert an ACK packet if the next regular packet can't hold all the acks that are pending.
+            if self.state.unacked_packets() > 4 {
+                let ack_packet = self.state.make_ack_packet();
+                self.sender.send(ack_packet);
+            }
+
+            if self.is_server && packet.opcode == Opcode::ControlHardResetClientV2 {
+                let packet = self
+                    .state
+                    .make_packet(Opcode::ControlHardResetServerV2, Vec::new());
+                self.sender.send(packet).unwrap();
+                // TODO: Normal OpenVPN waits for the client to send the first ControlV1 packet
+                // before establishing the session, to make DOS attacks harder. In the unlikely case
+                // that anyone runs this for real, this should be fixed here.
+                self.begin_tls_handshake_server().unwrap();
+            } else if !self.is_server && packet.opcode == Opcode::ControlHardResetServerV2 {
+                self.begin_tls_handshake_client().unwrap();
+            } else if packet.opcode == Opcode::ControlV1 {
+                self.tls_session.insert_payload(packet.payload).unwrap();
+            }
+        }
+    }
+
+    pub fn send_packets(&mut self) {
+        if let Some(tls_record_stream) = self.tls_session.get_tls_record_stream() {
+            for payload in tls_record_stream.get_written_records() {
+                let packet = self.state.make_packet(Opcode::ControlV1, payload);
+                self.sender.send(packet).unwrap();
+            }
         }
     }
 }
 
-/*
 impl Read for ControlChannel {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let mut receive_buffer: [u8; 2000] = [0; 2000];
+        self.send_packets();
+        self.receive_packets();
+        if let Some(stream) = self.tls_session.get_stream() {
+            return stream.read(buffer);
+        }
 
-        loop {
-            let length = self.socket.recv(&mut receive_buffer)?;
-            if length == 0 {
-                return Ok(0);
+        // Only the client can initialize a session.
+        if self.tls_session.is_uninitialized() {
+            if self.is_server {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
+            self.reset();
+        }
 
-            let packet = Packet::parse(&receive_buffer[..length]).unwrap();
-            if let Packet::Control(p) = packet {
-                let message = self.process_packet(&p).unwrap();
-                if message.opcode == Opcode::ControlV1 {
-                    buffer[0..message.payload.len()].copy_from_slice(message.payload);
-                    return Ok(message.payload.len());
-                }
-            } else {
-                panic!("at the disco");
-            }
+        if let Some(stream) = self.tls_session.get_stream() {
+            stream.read(buffer)
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
     }
 }
 
 impl Write for ControlChannel {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        /*
-        if data.len() >= 5 {
-            if data[0] == 0x16 {
-                println!("Have TLS record");
-                let length = u16::from_be_bytes([data[3], data[4]]);
-                println!("Record length {}", length);
-                return self.send_packet(Opcode::ControlV1, &data[0..(length as usize) + 5]);
-            }
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.send_packets();
+        self.receive_packets();
+        if let Some(stream) = self.tls_session.get_stream() {
+            let bytes_written = stream.write(buffer)?;
+            self.send_packets();
+            return Ok(bytes_written);
         }
-        */
-        self.send_packet(Opcode::ControlV1, data)
+
+        // Only the client can initialize a session.
+        if self.tls_session.is_uninitialized() {
+            if self.is_server {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            self.reset();
+            self.send_packets();
+        }
+
+        if let Some(stream) = self.tls_session.get_stream() {
+            stream.write(buffer)
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
-*/
 
 #[cfg(test)]
 mod record_stream_test {
@@ -320,7 +525,7 @@ mod record_stream_test {
     fn tls_record_stream_can_read() {
         let mut record_stream = TlsRecordStream::new();
         let mut read_buffer = [0; 5];
-        record_stream.insert_payload(RECORD1);
+        record_stream.insert_payload(RECORD1.to_vec());
         assert_eq!(record_stream.read(&mut read_buffer).unwrap(), 5);
         assert_eq!(read_buffer, RECORD1[..5]);
         assert_eq!(record_stream.read(&mut read_buffer).unwrap(), 5);
@@ -340,5 +545,178 @@ mod record_stream_test {
                 .read(&mut read_buf)
                 .is_err_and(|e| e.kind() == ErrorKind::WouldBlock)
         )
+    }
+}
+
+#[cfg(test)]
+mod control_channel_test {
+    use super::{ControlChannel, TlsSession};
+    use crate::packets::ControlChannelPacket;
+    use crate::packets::Opcode;
+    use openssl;
+    use openssl::pkey::{PKey, Private};
+    use openssl::x509::X509;
+    use rand::rng;
+    use std::io::{Read, Write};
+    use std::sync::mpsc::channel;
+
+    const CA_CERT: &'static [u8] = b"-----BEGIN CERTIFICATE-----
+MIIC/jCCAoWgAwIBAgIJAOGrHm6V0krZMAoGCCqGSM49BAMCMHcxCzAJBgNVBAYT
+Ak5MMQswCQYDVQQIEwJaSDEOMAwGA1UEBxMFRGVsZnQxEzARBgNVBAoTClBraVRl
+c3RlcnMxEzARBgNVBAMTClBraVRlc3RlcnMxITAfBgkqhkiG9w0BCQEWEm9wZW52
+cG5AZm94LWl0LmNvbTAeFw0xMzExMTMxNDM4MzRaFw0yMzExMTExNDM4MzRaMHcx
+CzAJBgNVBAYTAk5MMQswCQYDVQQIEwJaSDEOMAwGA1UEBxMFRGVsZnQxEzARBgNV
+BAoTClBraVRlc3RlcnMxEzARBgNVBAMTClBraVRlc3RlcnMxITAfBgkqhkiG9w0B
+CQEWEm9wZW52cG5AZm94LWl0LmNvbTB2MBAGByqGSM49AgEGBSuBBAAiA2IABE9f
+umyRTnsT5E+bQMmUMjaG40g5Ccxvy1rn6+jOiQGh0tUwpttojodM7M6WS3M2OrvZ
+Rr1eXewnWcLzkNbeQX2cxPnfiE3wQl+3PgnZa+QP55bqxEkpauP7CPu87+saXaOB
+3DCB2TAdBgNVHQ4EFgQUtCIuf0c+TM7ITEbDMC6lK7sbWukwgakGA1UdIwSBoTCB
+noAUtCIuf0c+TM7ITEbDMC6lK7sbWumhe6R5MHcxCzAJBgNVBAYTAk5MMQswCQYD
+VQQIEwJaSDEOMAwGA1UEBxMFRGVsZnQxEzARBgNVBAoTClBraVRlc3RlcnMxEzAR
+BgNVBAMTClBraVRlc3RlcnMxITAfBgkqhkiG9w0BCQEWEm9wZW52cG5AZm94LWl0
+LmNvbYIJAOGrHm6V0krZMAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwIDZwAwZAIw
+KBfaKAYWsEsIX3NsSgBJ7wXXI4eQy+mgQlqFHFQidr2uFwDY+NQe/Y5/x8dJfaWY
+AjA2v5jaw5ZopX8i0nSVTUWUzduBDsIOec8tK1bCXpVIBt+FM7IHUWck4OyXq+uj
+Rgg=
+-----END CERTIFICATE-----";
+
+    const SERVER_CERT: &'static [u8] = b"-----BEGIN CERTIFICATE-----
+MIIDYTCCAuigAwIBAgIBADAKBggqhkjOPQQDAjB3MQswCQYDVQQGEwJOTDELMAkG
+A1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0ZXJzMRMw
+EQYDVQQDEwpQa2lUZXN0ZXJzMSEwHwYJKoZIhvcNAQkBFhJvcGVudnBuQGZveC1p
+dC5jb20wHhcNMTMxMTEzMTQzOTE4WhcNMjMxMTExMTQzOTE4WjB4MQswCQYDVQQG
+EwJOTDELMAkGA1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lU
+ZXN0ZXJzMRQwEgYDVQQDFAtyb290X3NlcnZlcjEhMB8GCSqGSIb3DQEJARYSb3Bl
+bnZwbkBmb3gtaXQuY29tMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEkRPda7TjtdQ4
+YqPrVQgqua2EnkwLBUoMHtQ1vrkX4blPGfbLHHMpz2CqYDDitapGs9XA5pHT616q
+drmaCdV9d/cYbUlJLXJy1WX1r2+8bf1DYSqFkSGYY1vaLRFXhMeGo4IBRTCCAUEw
+CQYDVR0TBAIwADARBglghkgBhvhCAQEEBAMCBkAwNAYJYIZIAYb4QgENBCcWJUVh
+c3ktUlNBIEdlbmVyYXRlZCBTZXJ2ZXIgQ2VydGlmaWNhdGUwHQYDVR0OBBYEFIZ9
+0SO5BV/Jmy/S7oXDuB9CEE2qMIGpBgNVHSMEgaEwgZ6AFLQiLn9HPkzOyExGwzAu
+pSu7G1rpoXukeTB3MQswCQYDVQQGEwJOTDELMAkGA1UECBMCWkgxDjAMBgNVBAcT
+BURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0ZXJzMRMwEQYDVQQDEwpQa2lUZXN0ZXJz
+MSEwHwYJKoZIhvcNAQkBFhJvcGVudnBuQGZveC1pdC5jb22CCQDhqx5uldJK2TAT
+BgNVHSUEDDAKBggrBgEFBQcDATALBgNVHQ8EBAMCBaAwCgYIKoZIzj0EAwIDZwAw
+ZAIwOIuz2wrjE5RcroAH/WtJgAzy/qIyo5tJbW+fCzNB+wFniWwKVhJcF15de1Ha
+cyN7AjBkmxmSDp6liLYwWpuX+FxqUi9iP4XdtdvbhXhN9X6bREfO5ET1nhoqqRTX
+8KrRdVA=
+-----END CERTIFICATE-----";
+
+    const SERVER_KEY: &'static [u8] = b"-----BEGIN EC PARAMETERS-----
+BgUrgQQAIg==
+-----END EC PARAMETERS-----
+-----BEGIN EC PRIVATE KEY-----
+MIGkAgEBBDC0rD0sJ+XdRc0+bzZPgMZcngnJ7gXMy1jrUOohBlUm7zPmSnmUi+zf
+NwxqjX+Uyw2gBwYFK4EEACKhZANiAASRE91rtOO11Dhio+tVCCq5rYSeTAsFSgwe
+1DW+uRfhuU8Z9ssccynPYKpgMOK1qkaz1cDmkdPrXqp2uZoJ1X139xhtSUktcnLV
+ZfWvb7xt/UNhKoWRIZhjW9otEVeEx4Y=
+-----END EC PRIVATE KEY-----";
+
+    const CLIENT_CERT: &'static [u8] = b"-----BEGIN CERTIFICATE-----
+MIIDSjCCAtCgAwIBAgIBATAKBggqhkjOPQQDAjB3MQswCQYDVQQGEwJOTDELMAkG
+A1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0ZXJzMRMw
+EQYDVQQDEwpQa2lUZXN0ZXJzMSEwHwYJKoZIhvcNAQkBFhJvcGVudnBuQGZveC1p
+dC5jb20wHhcNMTMxMTEzMTQ0MTExWhcNMjMxMTExMTQ0MTExWjB6MQswCQYDVQQG
+EwJOTDELMAkGA1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lU
+ZXN0ZXJzMRYwFAYDVQQDFA1yb290X2NsaWVudF8xMSEwHwYJKoZIhvcNAQkBFhJv
+cGVudnBuQGZveC1pdC5jb20wdjAQBgcqhkjOPQIBBgUrgQQAIgNiAARGsC3L2S4v
++r2CdXu5tSCY2zyr4FvnmnC6aJIeJdg4PTWJYLTu+uaGVoIVDM5FyUHRwp3m2RkQ
+uz3mBkgubKn1wrSKXa/aWvbd3bCNz5uHW9/65ulUe3H5k+PLh6g0S56jggErMIIB
+JzAJBgNVHRMEAjAAMC0GCWCGSAGG+EIBDQQgFh5FYXN5LVJTQSBHZW5lcmF0ZWQg
+Q2VydGlmaWNhdGUwHQYDVR0OBBYEFLUws3mTDeMAEzdOeylzmnutSRvWMIGpBgNV
+HSMEgaEwgZ6AFLQiLn9HPkzOyExGwzAupSu7G1rpoXukeTB3MQswCQYDVQQGEwJO
+TDELMAkGA1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0
+ZXJzMRMwEQYDVQQDEwpQa2lUZXN0ZXJzMSEwHwYJKoZIhvcNAQkBFhJvcGVudnBu
+QGZveC1pdC5jb22CCQDhqx5uldJK2TATBgNVHSUEDDAKBggrBgEFBQcDAjALBgNV
+HQ8EBAMCB4AwCgYIKoZIzj0EAwIDaAAwZQIxAJhseGOzRQnOzCGGPppKjMPdQFLV
+ztt/bX8ygEneYsOYG+X6IySnpxT2GKBd17XFnQIwRwQvLDkyL85YCV1LRp9cW3sa
+ZRgB27ulkpmKvrg0H0PcaOQkPiIYMIidNA4M+RqQ
+-----END CERTIFICATE-----";
+
+    const CLIENT_KEY: &'static [u8] = b"-----BEGIN EC PARAMETERS-----
+BgUrgQQAIg==
+-----END EC PARAMETERS-----
+-----BEGIN EC PRIVATE KEY-----
+MIGkAgEBBDApsneFBw5ne/7Oj2YZfzq4upS8PWh1GbQwuhT3sOuVeio2hta/dg5Q
+AyP9o/4NnsWgBwYFK4EEACKhZANiAARGsC3L2S4v+r2CdXu5tSCY2zyr4FvnmnC6
+aJIeJdg4PTWJYLTu+uaGVoIVDM5FyUHRwp3m2RkQuz3mBkgubKn1wrSKXa/aWvbd
+3bCNz5uHW9/65ulUe3H5k+PLh6g0S54=
+-----END EC PRIVATE KEY-----";
+
+    #[test]
+    fn control_channel_sends_reset() {
+        let (_, receiver_incoming) = channel();
+        let (sender_outgoing, receiver_outgoing) = channel();
+        let ca_cert = X509::from_pem(CA_CERT).unwrap();
+        let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
+        let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
+        let mut control_channel = ControlChannel::new(
+            &mut rng(),
+            false,
+            ca_cert,
+            client_cert,
+            client_key,
+            receiver_incoming,
+            sender_outgoing,
+        );
+        control_channel.reset();
+
+        let packet = receiver_outgoing.try_recv().unwrap();
+        assert_eq!(packet.opcode, Opcode::ControlHardResetClientV2);
+        assert_eq!(packet.acks, &[]);
+        assert_eq!(packet.payload, &[]);
+    }
+
+    #[test]
+    fn control_channel_can_read_and_write() {
+        let (sender_server, receiver_client) = channel();
+        let (sender_client, receiver_server) = channel();
+        let ca_cert = X509::from_pem(CA_CERT).unwrap();
+        let server_cert = X509::from_pem(SERVER_CERT).unwrap();
+        let server_key = openssl::pkey::PKey::private_key_from_pem(SERVER_KEY).unwrap();
+        let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
+        let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
+        let mut client = ControlChannel::new(
+            &mut rng(),
+            false,
+            ca_cert.clone(),
+            client_cert,
+            client_key,
+            receiver_client,
+            sender_client,
+        );
+        let mut server = ControlChannel::new(
+            &mut rng(),
+            true,
+            ca_cert,
+            server_cert,
+            server_key,
+            receiver_server,
+            sender_server,
+        );
+
+        client.reset();
+        while !client.is_connected() || !server.is_connected() {
+            client.send_packets();
+            server.receive_packets();
+            server.send_packets();
+            client.receive_packets();
+        }
+
+        let mut read_buffer: [u8; 2000] = [0; 2000];
+        let message1 = b"Geht der nich noch?";
+        client.write(message1).unwrap();
+        let length = server.read(&mut read_buffer).unwrap();
+        assert_eq!(message1, &read_buffer[..length]);
+
+        let message2 = b"Der geht ja noch!";
+        client.write(message2).unwrap();
+        let length = server.read(&mut read_buffer).unwrap();
+        assert_eq!(message2, &read_buffer[..length]);
+
+        let message3 = b"Tut das Not dass der hier so rumoxidiert?";
+        client.write(message3).unwrap();
+        let length = server.read(&mut read_buffer).unwrap();
+        assert_eq!(message3, &read_buffer[..length]);
     }
 }

@@ -6,7 +6,7 @@ use crate::packets::{ControlChannelPacket, Opcode, Packet};
 #[derive(Debug)]
 struct PacketIdBuffer {
     /// Packet IDs that have not yet been acked.
-    unacked_ids: Vec<u32>,
+    pub unacked_ids: Vec<u32>,
     /// The (up to) eight most recent packet IDs for which we have sent acks. We can ack them again
     /// to avoid unnecessary resends in case the packet with the original ack got lost. This is
     /// recommended in the OpenVPN WIP RFC.
@@ -22,10 +22,6 @@ impl PacketIdBuffer {
             recent_packet_ids: [0; 8],
             recent_packet_ids_len: 0,
         }
-    }
-
-    pub fn insert_id(&mut self, id: u32) {
-        self.unacked_ids.push(id);
     }
 
     /// Returns up to `n` packet IDs to ack. IDs that have not been previously acked are
@@ -73,6 +69,10 @@ impl ControlChannelState {
             peer_session_id: None,
             peer_packet_ids: PacketIdBuffer::new(),
         }
+    }
+
+    pub fn unacked_packets(&self) -> usize {
+        self.peer_packet_ids.unacked_ids.len()
     }
 
     /// Make a control channel packet with the given opcode and payload.
@@ -132,7 +132,7 @@ impl ControlChannelState {
     pub fn process_packet<'b>(&mut self, packet: &ControlChannelPacket) {
         self.peer_session_id = Some(packet.session_id);
         if let Some(packet_id) = packet.packet_id {
-            self.peer_packet_ids.insert_id(packet_id);
+            self.peer_packet_ids.unacked_ids.push(packet_id);
         }
     }
 }
