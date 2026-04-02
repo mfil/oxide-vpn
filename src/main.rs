@@ -2,7 +2,6 @@ extern crate openssl;
 extern crate rand;
 
 mod control_channel;
-mod packet_channel;
 mod packets;
 mod retransmit;
 
@@ -12,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::net::UdpSocket;
 
-use control_channel::{ControlChannel, TlsRecordStream};
+use control_channel::ControlChannel;
 
 #[derive(Debug)]
 struct E {}
@@ -27,6 +26,7 @@ impl Error for E {}
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
+    /*
     let args = std::vec::Vec::from_iter(env::args());
     if args.len() < 6 {
         return Result::Err(Box::new(E {}));
@@ -67,5 +67,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     //let mut res = vec![];
     //stream.read_to_end(&mut res).unwrap();
     //println!("{:?}", res);
+    */
     Ok(())
 }

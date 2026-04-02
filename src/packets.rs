@@ -78,17 +78,17 @@ impl Opcode {
 }
 
 #[derive(Debug)]
-pub struct ControlChannelPacket<'a> {
+pub struct ControlChannelPacket {
     pub opcode: Opcode,
     pub key_id: u8,
     pub session_id: u64,
     pub acks: Vec<u32>,
     pub peer_session_id: Option<u64>,
     pub packet_id: Option<u32>,
-    pub payload: &'a [u8],
+    pub payload: Vec<u8>,
 }
 
-impl<'a> ControlChannelPacket<'a> {
+impl ControlChannelPacket {
     /// Calculate the required buffer size to write this packet in the wire format.
     fn size(&self) -> usize {
         let mut packet_size: usize = 1 + size_of::<u64>() + 1 + self.acks.len() * size_of::<u32>();
@@ -171,26 +171,26 @@ impl<'a> ControlChannelPacket<'a> {
         } else {
             rest
         };
-        rest[..self.payload.len()].copy_from_slice(self.payload);
+        rest[..self.payload.len()].copy_from_slice(&self.payload);
 
         Ok(size)
     }
 }
 
-pub struct DataChannelPacket<'a> {
+pub struct DataChannelPacket {
     opcode: Opcode,
     session_id: u64,
-    payload: &'a [u8],
+    payload: Vec<u8>,
 }
 
 /// OpenVPN UDP packet.
-pub enum Packet<'a> {
-    Control(ControlChannelPacket<'a>),
-    Data(DataChannelPacket<'a>),
+pub enum Packet {
+    Control(ControlChannelPacket),
+    Data(DataChannelPacket),
 }
 
-impl<'a> Packet<'a> {
-    pub fn parse(data: &'a [u8]) -> Result<Packet<'a>, PacketError> {
+impl Packet {
+    pub fn parse(data: &[u8]) -> Result<Packet, PacketError> {
         let first_byte = data
             .get(0)
             .ok_or(PacketError::with_message("Empty packet"))?;
@@ -205,7 +205,7 @@ impl<'a> Packet<'a> {
     fn parse_control_packet(
         opcode: Opcode,
         key_id: u8,
-        data: &'a [u8],
+        data: &[u8],
     ) -> Result<Packet, PacketError> {
         let (session_id_bytes, rest) = data[1..]
             .split_first_chunk::<8>()
@@ -254,7 +254,7 @@ impl<'a> Packet<'a> {
             acks,
             peer_session_id,
             packet_id,
-            payload,
+            payload: payload.to_vec(),
         };
         Ok(Self::Control(control_packet))
     }
@@ -295,10 +295,10 @@ impl<'a> Packet<'a> {
         }
     }
 
-    pub fn get_payload(&self) -> &'a [u8] {
+    pub fn get_payload(&self) -> &[u8] {
         match self {
-            Self::Control(p) => p.payload,
-            Self::Data(p) => p.payload,
+            Self::Control(p) => &p.payload,
+            Self::Data(p) => &p.payload,
         }
     }
 }
