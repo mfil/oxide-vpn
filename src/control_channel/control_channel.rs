@@ -5,6 +5,7 @@ use std::fmt;
 use std::io;
 use std::io::{Read, Write};
 use std::mem::swap;
+use std::string::ToString;
 use std::sync::mpsc::{Receiver, Sender};
 
 use rand::CryptoRng;
@@ -12,62 +13,14 @@ use rand::CryptoRng;
 use openssl;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{
-    HandshakeError, MidHandshakeSslStream, SslAcceptor, SslAcceptorBuilder, SslConnector,
-    SslMethod, SslStream, SslVerifyMode, SslVersion,
+    HandshakeError, MidHandshakeSslStream, SslAcceptor, SslConnector, SslMethod, SslStream,
+    SslVerifyMode, SslVersion,
 };
-use openssl::x509::X509;
+use openssl::x509::{X509, store::X509StoreBuilder};
 
 use super::control_channel_state::ControlChannelState;
 
-use crate::packets::{ControlChannelPacket, Opcode, PacketError};
-
-#[derive(Debug)]
-pub enum ControlChannelError {
-    Io(io::Error),
-    MalformedPacket(PacketError),
-    Other(&'static str),
-}
-
-impl fmt::Display for ControlChannelError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(e) => write!(formatter, "Control channel IO Error: {}", e)?,
-            Self::MalformedPacket(e) => {
-                write!(formatter, "Malformed packet in control channel: {}", e)?
-            }
-            Self::Other(message) => write!(formatter, "Control channel error: {}", message)?,
-        }
-        Result::Ok(())
-    }
-}
-
-impl From<io::Error> for ControlChannelError {
-    fn from(e: io::Error) -> Self {
-        ControlChannelError::Io(e)
-    }
-}
-
-impl From<PacketError> for ControlChannelError {
-    fn from(e: PacketError) -> Self {
-        ControlChannelError::MalformedPacket(e)
-    }
-}
-
-impl Error for ControlChannelError {}
-
-impl ControlChannelError {
-    pub fn with_message(message: &'static str) -> Self {
-        ControlChannelError::Other(message)
-    }
-
-    pub fn would_block(&self) -> bool {
-        if let Self::Io(e) = self {
-            e.kind() == io::ErrorKind::WouldBlock
-        } else {
-            false
-        }
-    }
-}
+use crate::packets::{ControlChannelPacket, Opcode};
 
 /// Reader + Writer for use by the [`SslConnector`].
 ///
@@ -259,18 +212,20 @@ pub struct ControlChannel {
     ca: X509,
     certificate: X509,
     private_key: PKey<Private>,
+    peer_name: String,
     receiver: Receiver<ControlChannelPacket>,
     sender: Sender<ControlChannelPacket>,
 }
 
 impl ControlChannel {
     /// Create new control channel.
-    pub fn new<R: CryptoRng>(
+    pub fn new<R: CryptoRng, S: ToString>(
         rng: &mut R,
         is_server: bool,
         ca: X509,
         certificate: X509,
         private_key: PKey<Private>,
+        peer_name: S,
         receiver: Receiver<ControlChannelPacket>,
         sender: Sender<ControlChannelPacket>,
     ) -> Self {
@@ -281,6 +236,7 @@ impl ControlChannel {
             ca,
             certificate,
             private_key,
+            peer_name: peer_name.to_string(),
             receiver,
             sender,
         }
@@ -291,16 +247,18 @@ impl ControlChannel {
     }
 
     fn begin_tls_handshake_client(&mut self) -> Result<(), HandshakeError<TlsRecordStream>> {
-        // TODO: Do actual cert verification.
         let mut connector_builder = SslConnector::builder(SslMethod::tls())?;
         connector_builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-        connector_builder.set_verify(SslVerifyMode::NONE);
-        connector_builder.set_certificate(&self.certificate);
-        connector_builder.set_private_key(&self.private_key);
+        connector_builder.set_verify(SslVerifyMode::PEER);
+        let mut ca_store = X509StoreBuilder::new()?;
+        ca_store.add_cert(self.ca.clone())?;
+        connector_builder.set_verify_cert_store(ca_store.build())?;
+        connector_builder.set_certificate(&self.certificate)?;
+        connector_builder.set_private_key(&self.private_key)?;
         let connector = connector_builder.build();
         let record_stream = TlsRecordStream::new();
 
-        match connector.connect("Control Channel", record_stream) {
+        match connector.connect(&self.peer_name, record_stream) {
             Ok(stream) => self.tls_session = TlsSession::Connected(stream),
             Err(HandshakeError::WouldBlock(stream)) => {
                 self.tls_session = TlsSession::Handshake(stream)
@@ -312,12 +270,14 @@ impl ControlChannel {
     }
 
     fn begin_tls_handshake_server(&mut self) -> Result<(), HandshakeError<TlsRecordStream>> {
-        // TODO: Do actual cert verification.
-        let mut acceptor_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+        let mut acceptor_builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls())?;
         acceptor_builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-        acceptor_builder.set_verify(SslVerifyMode::NONE);
-        acceptor_builder.set_certificate(&self.certificate);
-        acceptor_builder.set_private_key(&self.private_key);
+        acceptor_builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        let mut ca_store = X509StoreBuilder::new()?;
+        ca_store.add_cert(self.ca.clone())?;
+        acceptor_builder.set_verify_cert_store(ca_store.build())?;
+        acceptor_builder.set_certificate(&self.certificate)?;
+        acceptor_builder.set_private_key(&self.private_key)?;
         let acceptor = acceptor_builder.build();
         let record_stream = TlsRecordStream::new();
 
@@ -351,7 +311,7 @@ impl ControlChannel {
             // Insert an ACK packet if the next regular packet can't hold all the acks that are pending.
             if self.state.unacked_packets() > 4 {
                 let ack_packet = self.state.make_ack_packet();
-                self.sender.send(ack_packet);
+                self.sender.send(ack_packet).unwrap();
             }
 
             if self.is_server && packet.opcode == Opcode::ControlHardResetClientV2 {
@@ -550,98 +510,65 @@ mod record_stream_test {
 
 #[cfg(test)]
 mod control_channel_test {
-    use super::{ControlChannel, TlsSession};
-    use crate::packets::ControlChannelPacket;
+    use super::ControlChannel;
     use crate::packets::Opcode;
     use openssl;
-    use openssl::pkey::{PKey, Private};
     use openssl::x509::X509;
     use rand::rng;
     use std::io::{Read, Write};
     use std::sync::mpsc::channel;
 
+    // TODO: The proper way would be to make new certificates when testing, but the hard-coded
+    // certificates below are valid until 2036, so that shouldn't matter. By writing this, I have
+    // ensured that this program will see actual, long term use, of course!
     const CA_CERT: &'static [u8] = b"-----BEGIN CERTIFICATE-----
-MIIC/jCCAoWgAwIBAgIJAOGrHm6V0krZMAoGCCqGSM49BAMCMHcxCzAJBgNVBAYT
-Ak5MMQswCQYDVQQIEwJaSDEOMAwGA1UEBxMFRGVsZnQxEzARBgNVBAoTClBraVRl
-c3RlcnMxEzARBgNVBAMTClBraVRlc3RlcnMxITAfBgkqhkiG9w0BCQEWEm9wZW52
-cG5AZm94LWl0LmNvbTAeFw0xMzExMTMxNDM4MzRaFw0yMzExMTExNDM4MzRaMHcx
-CzAJBgNVBAYTAk5MMQswCQYDVQQIEwJaSDEOMAwGA1UEBxMFRGVsZnQxEzARBgNV
-BAoTClBraVRlc3RlcnMxEzARBgNVBAMTClBraVRlc3RlcnMxITAfBgkqhkiG9w0B
-CQEWEm9wZW52cG5AZm94LWl0LmNvbTB2MBAGByqGSM49AgEGBSuBBAAiA2IABE9f
-umyRTnsT5E+bQMmUMjaG40g5Ccxvy1rn6+jOiQGh0tUwpttojodM7M6WS3M2OrvZ
-Rr1eXewnWcLzkNbeQX2cxPnfiE3wQl+3PgnZa+QP55bqxEkpauP7CPu87+saXaOB
-3DCB2TAdBgNVHQ4EFgQUtCIuf0c+TM7ITEbDMC6lK7sbWukwgakGA1UdIwSBoTCB
-noAUtCIuf0c+TM7ITEbDMC6lK7sbWumhe6R5MHcxCzAJBgNVBAYTAk5MMQswCQYD
-VQQIEwJaSDEOMAwGA1UEBxMFRGVsZnQxEzARBgNVBAoTClBraVRlc3RlcnMxEzAR
-BgNVBAMTClBraVRlc3RlcnMxITAfBgkqhkiG9w0BCQEWEm9wZW52cG5AZm94LWl0
-LmNvbYIJAOGrHm6V0krZMAwGA1UdEwQFMAMBAf8wCgYIKoZIzj0EAwIDZwAwZAIw
-KBfaKAYWsEsIX3NsSgBJ7wXXI4eQy+mgQlqFHFQidr2uFwDY+NQe/Y5/x8dJfaWY
-AjA2v5jaw5ZopX8i0nSVTUWUzduBDsIOec8tK1bCXpVIBt+FM7IHUWck4OyXq+uj
-Rgg=
+MIIBtjCCAWigAwIBAgIUOqLE/7GfIrvwcOJXZqkd94HIfzYwBQYDK2VwMGExCzAJ
+BgNVBAYTAk5MMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5l
+dCBXaWRnaXRzIFB0eSBMdGQxGjAYBgNVBAMMEU94aWRlIFZQTiBUZXN0IENBMB4X
+DTI2MDMyODE2MTU0OVoXDTM2MDMyNTE2MTU0OVowYTELMAkGA1UEBhMCTkwxEzAR
+BgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoMGEludGVybmV0IFdpZGdpdHMgUHR5
+IEx0ZDEaMBgGA1UEAwwRT3hpZGUgVlBOIFRlc3QgQ0EwKjAFBgMrZXADIQC5Zu95
+rcIz/3ahqwrrxra/U+krsgNMPypuVyLkwC30dqMyMDAwDwYDVR0TAQH/BAUwAwEB
+/zAdBgNVHQ4EFgQUEvhE0R20BY5NnAFYvn3PexqtyYwwBQYDK2VwA0EA034o+dZ6
+s8z0YlKGp+GNjzhv2dd3H0ondbtpsKvz93SxoylUCPHdKIHV2UjcuFlgnOzRJQfd
+b3x69z8muTGiDw==
 -----END CERTIFICATE-----";
 
     const SERVER_CERT: &'static [u8] = b"-----BEGIN CERTIFICATE-----
-MIIDYTCCAuigAwIBAgIBADAKBggqhkjOPQQDAjB3MQswCQYDVQQGEwJOTDELMAkG
-A1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0ZXJzMRMw
-EQYDVQQDEwpQa2lUZXN0ZXJzMSEwHwYJKoZIhvcNAQkBFhJvcGVudnBuQGZveC1p
-dC5jb20wHhcNMTMxMTEzMTQzOTE4WhcNMjMxMTExMTQzOTE4WjB4MQswCQYDVQQG
-EwJOTDELMAkGA1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lU
-ZXN0ZXJzMRQwEgYDVQQDFAtyb290X3NlcnZlcjEhMB8GCSqGSIb3DQEJARYSb3Bl
-bnZwbkBmb3gtaXQuY29tMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEkRPda7TjtdQ4
-YqPrVQgqua2EnkwLBUoMHtQ1vrkX4blPGfbLHHMpz2CqYDDitapGs9XA5pHT616q
-drmaCdV9d/cYbUlJLXJy1WX1r2+8bf1DYSqFkSGYY1vaLRFXhMeGo4IBRTCCAUEw
-CQYDVR0TBAIwADARBglghkgBhvhCAQEEBAMCBkAwNAYJYIZIAYb4QgENBCcWJUVh
-c3ktUlNBIEdlbmVyYXRlZCBTZXJ2ZXIgQ2VydGlmaWNhdGUwHQYDVR0OBBYEFIZ9
-0SO5BV/Jmy/S7oXDuB9CEE2qMIGpBgNVHSMEgaEwgZ6AFLQiLn9HPkzOyExGwzAu
-pSu7G1rpoXukeTB3MQswCQYDVQQGEwJOTDELMAkGA1UECBMCWkgxDjAMBgNVBAcT
-BURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0ZXJzMRMwEQYDVQQDEwpQa2lUZXN0ZXJz
-MSEwHwYJKoZIhvcNAQkBFhJvcGVudnBuQGZveC1pdC5jb22CCQDhqx5uldJK2TAT
-BgNVHSUEDDAKBggrBgEFBQcDATALBgNVHQ8EBAMCBaAwCgYIKoZIzj0EAwIDZwAw
-ZAIwOIuz2wrjE5RcroAH/WtJgAzy/qIyo5tJbW+fCzNB+wFniWwKVhJcF15de1Ha
-cyN7AjBkmxmSDp6liLYwWpuX+FxqUi9iP4XdtdvbhXhN9X6bREfO5ET1nhoqqRTX
-8KrRdVA=
+MIIB7DCCAZ6gAwIBAgIUY4qwfEA65HL0Hq9ndt+Zu2LOCqAwBQYDK2VwMGExCzAJ
+BgNVBAYTAk5MMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5l
+dCBXaWRnaXRzIFB0eSBMdGQxGjAYBgNVBAMMEU94aWRlIFZQTiBUZXN0IENBMB4X
+DTI2MDQwMzAwNTgyNVoXDTM2MDMzMTAwNTgyNVowZTELMAkGA1UEBhMCTkwxEzAR
+BgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoMGEludGVybmV0IFdpZGdpdHMgUHR5
+IEx0ZDEeMBwGA1UEAwwVT3hpZGUgVlBOIFRlc3QgU2VydmVyMCowBQYDK2VwAyEA
+rqNgtsVVOCl4FbFcqr3PL5Oq7Nv7Rxv7RpsiIXc8/eSjZDBiMAsGA1UdDwQEAwIH
+gDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUC3q5TGtQ86pS5RR5Aosg
+PeKdbgcwHwYDVR0jBBgwFoAUEvhE0R20BY5NnAFYvn3PexqtyYwwBQYDK2VwA0EA
+HmNg+CL3AOpVO6qgNuy8mTq7LWS0PDZoeWzjU55nUpbN/6BWPCQealZAv70Gxk/e
+nU7UBlPgOEvMwOSK+prqCg==
 -----END CERTIFICATE-----";
 
-    const SERVER_KEY: &'static [u8] = b"-----BEGIN EC PARAMETERS-----
-BgUrgQQAIg==
------END EC PARAMETERS-----
------BEGIN EC PRIVATE KEY-----
-MIGkAgEBBDC0rD0sJ+XdRc0+bzZPgMZcngnJ7gXMy1jrUOohBlUm7zPmSnmUi+zf
-NwxqjX+Uyw2gBwYFK4EEACKhZANiAASRE91rtOO11Dhio+tVCCq5rYSeTAsFSgwe
-1DW+uRfhuU8Z9ssccynPYKpgMOK1qkaz1cDmkdPrXqp2uZoJ1X139xhtSUktcnLV
-ZfWvb7xt/UNhKoWRIZhjW9otEVeEx4Y=
------END EC PRIVATE KEY-----";
+    const SERVER_KEY: &'static [u8] = b"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIOYC8vaWDzkj24MZtD7Q4nobUo5T016f7yVRVooGmabx
+-----END PRIVATE KEY-----";
 
     const CLIENT_CERT: &'static [u8] = b"-----BEGIN CERTIFICATE-----
-MIIDSjCCAtCgAwIBAgIBATAKBggqhkjOPQQDAjB3MQswCQYDVQQGEwJOTDELMAkG
-A1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0ZXJzMRMw
-EQYDVQQDEwpQa2lUZXN0ZXJzMSEwHwYJKoZIhvcNAQkBFhJvcGVudnBuQGZveC1p
-dC5jb20wHhcNMTMxMTEzMTQ0MTExWhcNMjMxMTExMTQ0MTExWjB6MQswCQYDVQQG
-EwJOTDELMAkGA1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lU
-ZXN0ZXJzMRYwFAYDVQQDFA1yb290X2NsaWVudF8xMSEwHwYJKoZIhvcNAQkBFhJv
-cGVudnBuQGZveC1pdC5jb20wdjAQBgcqhkjOPQIBBgUrgQQAIgNiAARGsC3L2S4v
-+r2CdXu5tSCY2zyr4FvnmnC6aJIeJdg4PTWJYLTu+uaGVoIVDM5FyUHRwp3m2RkQ
-uz3mBkgubKn1wrSKXa/aWvbd3bCNz5uHW9/65ulUe3H5k+PLh6g0S56jggErMIIB
-JzAJBgNVHRMEAjAAMC0GCWCGSAGG+EIBDQQgFh5FYXN5LVJTQSBHZW5lcmF0ZWQg
-Q2VydGlmaWNhdGUwHQYDVR0OBBYEFLUws3mTDeMAEzdOeylzmnutSRvWMIGpBgNV
-HSMEgaEwgZ6AFLQiLn9HPkzOyExGwzAupSu7G1rpoXukeTB3MQswCQYDVQQGEwJO
-TDELMAkGA1UECBMCWkgxDjAMBgNVBAcTBURlbGZ0MRMwEQYDVQQKEwpQa2lUZXN0
-ZXJzMRMwEQYDVQQDEwpQa2lUZXN0ZXJzMSEwHwYJKoZIhvcNAQkBFhJvcGVudnBu
-QGZveC1pdC5jb22CCQDhqx5uldJK2TATBgNVHSUEDDAKBggrBgEFBQcDAjALBgNV
-HQ8EBAMCB4AwCgYIKoZIzj0EAwIDaAAwZQIxAJhseGOzRQnOzCGGPppKjMPdQFLV
-ztt/bX8ygEneYsOYG+X6IySnpxT2GKBd17XFnQIwRwQvLDkyL85YCV1LRp9cW3sa
-ZRgB27ulkpmKvrg0H0PcaOQkPiIYMIidNA4M+RqQ
+MIIB7DCCAZ6gAwIBAgIUNwQaliRY45G6/EjJe0vDNKXAflMwBQYDK2VwMGExCzAJ
+BgNVBAYTAk5MMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5l
+dCBXaWRnaXRzIFB0eSBMdGQxGjAYBgNVBAMMEU94aWRlIFZQTiBUZXN0IENBMB4X
+DTI2MDQwMzAwNTcwMFoXDTM2MDMzMTAwNTcwMFowZTELMAkGA1UEBhMCTkwxEzAR
+BgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoMGEludGVybmV0IFdpZGdpdHMgUHR5
+IEx0ZDEeMBwGA1UEAwwVT3hpZGUgVlBOIFRlc3QgQ2xpZW50MCowBQYDK2VwAyEA
+RJJKdjiJV6M6hwbFoilRSptu145KsLSBsIAWCAfxBWKjZDBiMAsGA1UdDwQEAwIH
+gDATBgNVHSUEDDAKBggrBgEFBQcDAjAdBgNVHQ4EFgQUdK+JTdmhfRRNYzaTdwzL
+bKRMN3MwHwYDVR0jBBgwFoAUEvhE0R20BY5NnAFYvn3PexqtyYwwBQYDK2VwA0EA
+1Qs/hX5CjbFYpHfqlLqDZZ0u+zVqHogGFX9s9QURywuSgjwKOyapnZXexLaJRLoX
+x1FLmZyk94KX8bfj/1xtAA==
 -----END CERTIFICATE-----";
 
-    const CLIENT_KEY: &'static [u8] = b"-----BEGIN EC PARAMETERS-----
-BgUrgQQAIg==
------END EC PARAMETERS-----
------BEGIN EC PRIVATE KEY-----
-MIGkAgEBBDApsneFBw5ne/7Oj2YZfzq4upS8PWh1GbQwuhT3sOuVeio2hta/dg5Q
-AyP9o/4NnsWgBwYFK4EEACKhZANiAARGsC3L2S4v+r2CdXu5tSCY2zyr4FvnmnC6
-aJIeJdg4PTWJYLTu+uaGVoIVDM5FyUHRwp3m2RkQuz3mBkgubKn1wrSKXa/aWvbd
-3bCNz5uHW9/65ulUe3H5k+PLh6g0S54=
------END EC PRIVATE KEY-----";
+    const CLIENT_KEY: &'static [u8] = b"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
+-----END PRIVATE KEY-----";
 
     #[test]
     fn control_channel_sends_reset() {
@@ -656,6 +583,7 @@ aJIeJdg4PTWJYLTu+uaGVoIVDM5FyUHRwp3m2RkQuz3mBkgubKn1wrSKXa/aWvbd
             ca_cert,
             client_cert,
             client_key,
+            "Oxide VPN Test Server",
             receiver_incoming,
             sender_outgoing,
         );
@@ -682,6 +610,7 @@ aJIeJdg4PTWJYLTu+uaGVoIVDM5FyUHRwp3m2RkQuz3mBkgubKn1wrSKXa/aWvbd
             ca_cert.clone(),
             client_cert,
             client_key,
+            "Oxide VPN Test Server",
             receiver_client,
             sender_client,
         );
@@ -691,6 +620,7 @@ aJIeJdg4PTWJYLTu+uaGVoIVDM5FyUHRwp3m2RkQuz3mBkgubKn1wrSKXa/aWvbd
             ca_cert,
             server_cert,
             server_key,
+            "Oxide VPN Test Client",
             receiver_server,
             sender_server,
         );
