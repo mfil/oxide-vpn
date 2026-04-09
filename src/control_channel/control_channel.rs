@@ -18,6 +18,7 @@ use openssl::x509::{X509, store::X509StoreBuilder};
 use super::control_channel_state::ControlChannelState;
 use super::tls_record_stream::TlsRecordStream;
 
+use crate::data_channel::{ClientToServer, EpochKey, ServerToClient};
 use crate::packets::{ControlChannelPacket, Opcode};
 
 #[derive(Debug)]
@@ -240,6 +241,31 @@ impl ControlChannel {
                 let packet = self.state.make_packet(Opcode::ControlV1, payload);
                 self.sender.send(packet).unwrap();
             }
+        }
+    }
+
+    /// Run the TLS-Exporter to obtain a shared symmetric key for the data channel.
+    pub fn derive_data_channel_keys(
+        &self,
+    ) -> Option<(EpochKey<ClientToServer>, EpochKey<ServerToClient>)> {
+        if let TlsSession::Connected(ssl_stream) = &self.tls_session {
+            // We need to generate more key material than we actually use due to backwards
+            // compatibility in the OpenVPN protocol.
+            let mut key_buffer: [u8; 256] = [0; _];
+            ssl_stream
+                .ssl()
+                .export_keying_material(&mut key_buffer, "EXPORTER-OpenVPN-datakeys", None)
+                .unwrap();
+            let (chunks, _) = key_buffer.as_chunks::<32>();
+            let client_to_server = EpochKey::<ClientToServer>::from_key_material(&chunks[0]);
+            let server_to_client = EpochKey::<ServerToClient>::from_key_material(&chunks[4]);
+
+            unsafe {
+                memsec::memzero(key_buffer.as_mut_ptr(), key_buffer.len());
+            }
+            Some((client_to_server, server_to_client))
+        } else {
+            None
         }
     }
 }

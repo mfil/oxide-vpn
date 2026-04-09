@@ -1,4 +1,5 @@
 extern crate bitflags;
+extern crate memsec;
 extern crate openssl;
 extern crate rand;
 
@@ -18,6 +19,7 @@ use openssl::x509::X509;
 use rand::rng;
 
 mod control_channel;
+mod data_channel;
 mod packets;
 mod retransmit;
 
