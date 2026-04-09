@@ -1,9 +1,10 @@
+extern crate bitflags;
 extern crate openssl;
 extern crate rand;
 
 use std::env;
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::UdpSocket;
@@ -21,6 +22,7 @@ mod packets;
 mod retransmit;
 
 use control_channel::ControlChannel;
+use control_channel::messages::{IvProto, PeerInfo};
 use packets::{ControlChannelPacket, Packet};
 
 #[derive(Debug)]
@@ -73,6 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         X509::from_pem(&ca_pem)?,
         X509::from_pem(&cert_pem)?,
         PKey::private_key_from_pem(&key_pem)?,
+        "Oxide VPN Test Server",
         control_receive,
         control_send,
     );
@@ -86,18 +89,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             let length = socket.recv(&mut read_buffer)?;
             let packet = Packet::parse(&read_buffer[..length]).unwrap();
             if let Packet::Control(p) = packet {
+                println!("{}", p.key_id);
                 send_channel.send(p).unwrap();
             }
         }
         Ok(())
     });
 
+    let socket_write = socket.try_clone()?;
     let socket_write_thread = thread::spawn(move || -> std::io::Result<()> {
-        let socket = socket;
+        let socket = socket_write;
         let mut write_buffer: [u8; 3000] = [0; 3000];
         let receive_channel = outgoing_receive;
         while !SHUTDOWN.load(Ordering::Relaxed) {
             let packet = receive_channel.recv().unwrap();
+            if packet.opcode != crate::packets::Opcode::ControlHardResetClientV2
+                && packet.peer_session_id.is_none()
+            {
+                println!("oh no");
+            }
             let length = packet.to_buffer(&mut write_buffer).unwrap();
             socket.send(&write_buffer[..length])?;
         }
@@ -106,10 +116,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut read_buffer: [u8; 3000] = [0; 3000];
     let mut count = 0;
+    control_channel.reset();
+    while !control_channel.is_connected() {
+        control_channel.receive_packets();
+        control_channel.send_packets();
+        thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let peer_info = PeerInfo {
+        iv_proto: IvProto::SUPPORT_DATA_V2
+            | IvProto::EXPECT_PUSH_REPLY
+            | IvProto::CAN_DO_KEY_MAT_EXPORT
+            | IvProto::EPOCH_DATA_FORMAT,
+        iv_ciphers: "AES-256-GCM:CHACHA20-POLY1305",
+    };
+    let mut write_buffer: [u8; 2000] = [0; 2000];
+    let length = peer_info.to_buffer(&mut rng(), &mut write_buffer);
+    control_channel.write(&write_buffer[..length])?;
+    control_channel.flush()?;
     while !SHUTDOWN.load(Ordering::Relaxed) {
-        if let Ok(length) = control_channel.write(b"Hello") {
-            println!("Wrote {} bytes", length);
-        }
         if let Ok(length) = control_channel.read(&mut read_buffer) {
             println!("{:?}", &read_buffer[..length]);
         }

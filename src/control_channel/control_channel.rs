@@ -137,7 +137,7 @@ impl ControlChannel {
         }
     }
 
-    fn is_connected(&self) -> bool {
+    pub fn is_connected(&self) -> bool {
         self.tls_session.is_connected()
     }
 
@@ -305,7 +305,11 @@ impl Write for ControlChannel {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        if let Some(stream) = self.tls_session.get_stream() {
+            stream.flush()
+        } else {
+            Ok(())
+        }
     }
 }
 

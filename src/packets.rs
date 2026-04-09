@@ -1,5 +1,4 @@
 //! This module defines the different packet types used in OpenVPN and contains functions for parsing them.
-
 use std::convert::From;
 use std::error::Error;
 use std::fmt;
@@ -177,6 +176,7 @@ impl ControlChannelPacket {
     }
 }
 
+#[derive(Debug)]
 pub struct DataChannelPacket {
     opcode: Opcode,
     session_id: u64,
@@ -184,6 +184,7 @@ pub struct DataChannelPacket {
 }
 
 /// OpenVPN UDP packet.
+#[derive(Debug)]
 pub enum Packet {
     Control(ControlChannelPacket),
     Data(DataChannelPacket),
