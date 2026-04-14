@@ -73,7 +73,6 @@ impl<'a> PeerInfo<'a> {
             self.iv_ciphers,
         )
         .unwrap();
-        println!("{}", out);
         out
     }
 }

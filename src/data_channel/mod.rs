@@ -1,3 +1,5 @@
+mod data_channel;
 mod keys;
 
-pub use keys::{ClientToServer, EpochKey, ServerToClient};
+pub use data_channel::{AES_256_GCM, DataChannel};
+pub use keys::{DataChannelKeys, EpochKey};

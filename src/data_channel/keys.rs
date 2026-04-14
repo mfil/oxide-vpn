@@ -1,7 +1,6 @@
 //! Contains the OpenVPN key derivation functions.
 
 use std::convert::From;
-use std::marker::PhantomData;
 use std::ops::Drop;
 
 use openssl::error::ErrorStack;
@@ -30,6 +29,11 @@ impl From<ErrorStack> for Error {
 }
 
 impl std::error::Error for Error {}
+
+pub struct DataChannelKeys {
+    pub client_to_server: EpochKey,
+    pub server_to_client: EpochKey,
+}
 
 /// OpenVPN key derivation function, based on the TLS-Exporter in TLS 1.3.
 /// Fills the slice given in `out` with key material.
@@ -80,17 +84,6 @@ fn ovpn_expand_label(
     Ok(())
 }
 
-/// Marker trait for the direction of keys. This allows compile-time checks that keys are only used
-/// for the appropriate direction.
-pub trait Direction {}
-
-/// Marks a key for the client-to-server direction.
-pub struct ClientToServer();
-impl Direction for ClientToServer {}
-/// Marks a key for the server-to-client direction.
-pub struct ServerToClient();
-impl Direction for ServerToClient {}
-
 /// A key-derivation key. With 64-bit packet IDs, data channels may send a large number of packets
 /// before a key renegotiation happens, so the symmetric encryption keys need to be regularly
 /// changed. An epoch key is used to derive an AEAD key, an implicit IV and the next epoch key. This
@@ -106,13 +99,12 @@ impl Direction for ServerToClient {}
 ///                                      V
 ///                                     E_3 --> K_3
 /// ```
-pub struct EpochKey<D: Direction> {
+pub struct EpochKey {
     pub epoch: u16,
     key_bytes: [u8; 32],
-    _phantom_data: PhantomData<D>,
 }
 
-impl<D: Direction> Drop for EpochKey<D> {
+impl Drop for EpochKey {
     fn drop(&mut self) {
         // Securely erase the key material when this goes out of scope.
         unsafe { memsec::memzero(self.key_bytes.as_mut_ptr(), self.key_bytes.len()) }
@@ -120,13 +112,12 @@ impl<D: Direction> Drop for EpochKey<D> {
 }
 
 /// A symmetric encryption (AEAD) key for encrypting and authenticating data channel packets.
-pub struct EncryptionKey<D: Direction> {
+pub struct EncryptionKey {
     pub epoch: u16,
     pub key_bytes: [u8; 32],
-    _phantom_data: PhantomData<D>,
 }
 
-impl<D: Direction> Drop for EncryptionKey<D> {
+impl Drop for EncryptionKey {
     fn drop(&mut self) {
         // Securely erase the key material when this goes out of scope.
         unsafe { memsec::memzero(self.key_bytes.as_mut_ptr(), self.key_bytes.len()) }
@@ -139,12 +130,11 @@ pub struct ImplicitIv {
     pub iv_bytes: [u8; 12],
 }
 
-impl<D: Direction> EpochKey<D> {
+impl EpochKey {
     pub fn from_key_material(key_bytes: &[u8; 32]) -> Self {
         Self {
             epoch: 1,
             key_bytes: *key_bytes,
-            _phantom_data: PhantomData {},
         }
     }
 
@@ -161,11 +151,10 @@ impl<D: Direction> EpochKey<D> {
     }
 
     /// Derive the encryption key for this epoch.
-    pub fn derive_encryption_key(&self) -> Result<EncryptionKey<D>, Error> {
+    pub fn derive_encryption_key(&self) -> Result<EncryptionKey, Error> {
         let mut key = EncryptionKey {
             epoch: self.epoch,
             key_bytes: [0; _],
-            _phantom_data: PhantomData {},
         };
         ovpn_expand_label(&self.key_bytes, b"data_key", b"", &mut key.key_bytes)?;
         Ok(key)
@@ -184,6 +173,8 @@ impl<D: Direction> EpochKey<D> {
 
 #[cfg(test)]
 mod test {
+    use crate::data_channel::EpochKey;
+
     use super::ovpn_expand_label;
 
     #[test]
@@ -202,5 +193,40 @@ mod test {
             0x20, 0x46,
         ];
         assert_eq!(out, out_expected);
+    }
+
+    #[test]
+    fn test_deriving_data_keys() {
+        // Results extracted from OpenVPN logs.
+        let epoch_key_bytes = [
+            0xd1, 0x89, 0x60, 0xcb, 0x5b, 0xf1, 0x1c, 0x70, 0x09, 0x99, 0xec, 0x6f, 0x1c, 0xbe,
+            0x00, 0x40, 0x7f, 0x26, 0xb7, 0xac, 0xe4, 0x7a, 0xb9, 0x63, 0x41, 0x9a, 0xe4, 0x09,
+            0xd8, 0xed, 0xb9, 0xfb,
+        ];
+        let mut epoch_key = EpochKey::from_key_material(&epoch_key_bytes);
+        let expected_data_keys = [
+            [
+                0xc4, 0xe6, 0xc8, 0x46, 0x7f, 0x67, 0x45, 0x4c, 0xc2, 0xdd, 0x08, 0x73, 0x53, 0x4b,
+                0x93, 0xd8, 0x1f, 0x07, 0x3f, 0x3a, 0x82, 0x17, 0xe4, 0x19, 0xbd, 0xc9, 0x55, 0x26,
+                0x26, 0x50, 0xed, 0x2d,
+            ],
+            [
+                0xbd, 0x21, 0x60, 0x73, 0xec, 0xac, 0x56, 0xe6, 0x4a, 0x15, 0x05, 0xb3, 0x56, 0xc5,
+                0xe8, 0x35, 0x11, 0x79, 0x1e, 0x44, 0x36, 0x0e, 0xeb, 0x22, 0xc3, 0x9d, 0x86, 0xfe,
+                0x42, 0x2e, 0x3f, 0x0a,
+            ],
+            [
+                0x53, 0xdd, 0xf8, 0xc0, 0x03, 0x58, 0x26, 0xbb, 0x5b, 0x9c, 0xe6, 0xd6, 0x5b, 0x80,
+                0xaa, 0x98, 0xc6, 0xcc, 0x46, 0x04, 0x8b, 0xc7, 0x38, 0xc1, 0xf8, 0xb4, 0x4a, 0xde,
+                0x34, 0x87, 0xfa, 0x58,
+            ],
+        ];
+        for (i, expected_key) in expected_data_keys.iter().enumerate() {
+            println!("Testing data key {}", i + 1);
+            let data_key = epoch_key.derive_encryption_key().unwrap();
+            assert_eq!(data_key.epoch, (i + 1) as u16);
+            assert_eq!(data_key.key_bytes, *expected_key);
+            epoch_key.advance_epoch().unwrap();
+        }
     }
 }

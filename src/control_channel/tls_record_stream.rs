@@ -82,7 +82,6 @@ impl Write for TlsRecordStream {
             let mut new_record = Vec::with_capacity(self.partial_record.len() + missing_bytes);
             new_record.extend_from_slice(&self.partial_record);
             new_record.extend_from_slice(record_tail);
-            println!("Record length = {}", new_record.len());
             self.written_tls_records.push(new_record);
             self.partial_record.clear();
         }
@@ -97,7 +96,6 @@ impl Write for TlsRecordStream {
             }
 
             (record, rest) = rest.split_at(record_len);
-            println!("Record length = {}", record.len());
             self.written_tls_records.push(record.to_vec());
         }
         Ok(buffer.len() - rest.len())

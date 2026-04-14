@@ -46,6 +46,8 @@ pub enum Opcode {
     ControlHardResetClientV2 = 7,
     /// Initial key from server, forget previous state
     ControlHardResetServerV2 = 8,
+    /// Data channel packet with user id.
+    DataV2 = 9,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -56,6 +58,7 @@ impl TryFrom<u8> for Opcode {
             5 => Ok(Opcode::ControlAckV1),
             7 => Ok(Opcode::ControlHardResetClientV2),
             8 => Ok(Opcode::ControlHardResetServerV2),
+            9 => Ok(Opcode::DataV2),
             _ => Err(PacketError::with_message("Invalid opcode")),
         }
     }
@@ -68,6 +71,7 @@ impl Opcode {
             Opcode::ControlAckV1 => OpcodeType::Control,
             Opcode::ControlHardResetClientV2 => OpcodeType::Control,
             Opcode::ControlHardResetServerV2 => OpcodeType::Control,
+            Opcode::DataV2 => OpcodeType::Data,
         }
     }
 
@@ -178,9 +182,39 @@ impl ControlChannelPacket {
 
 #[derive(Debug)]
 pub struct DataChannelPacket {
-    opcode: Opcode,
-    session_id: u64,
-    payload: Vec<u8>,
+    pub opcode: Opcode,
+    pub key_id: u8,
+    pub packet_data: Vec<u8>,
+}
+
+impl DataChannelPacket {
+    const PEER_ID_OFFSET: usize = 1;
+    pub fn get_peer_id(&self) -> &[u8; 3] {
+        self.packet_data[Self::PEER_ID_OFFSET..]
+            .first_chunk::<3>()
+            .unwrap()
+    }
+
+    const PACKET_ID_OFFSET: usize = Self::PEER_ID_OFFSET + 3;
+    pub fn get_packet_id(&self) -> &[u8; 8] {
+        self.packet_data[Self::PACKET_ID_OFFSET..]
+            .first_chunk::<8>()
+            .unwrap()
+    }
+
+    const PAYLOAD_OFFSET: usize = Self::PACKET_ID_OFFSET + 8;
+    pub fn get_payload(&self) -> &[u8] {
+        &self.packet_data[Self::PAYLOAD_OFFSET..(self.packet_data.len() - 16)]
+    }
+
+    pub fn get_auth_tag(&self) -> &[u8; 16] {
+        self.packet_data.last_chunk::<16>().unwrap()
+    }
+
+    /// Get the unencrypted but authenticated portion of the packet. That is, the "AD" in "AEAD".
+    pub fn get_additional_authenticated_data(&self) -> &[u8; 12] {
+        &self.packet_data.first_chunk::<12>().unwrap()
+    }
 }
 
 /// OpenVPN UDP packet.
@@ -199,7 +233,7 @@ impl Packet {
         let key_id = first_byte & 0x07;
         match opcode.get_type() {
             OpcodeType::Control => Self::parse_control_packet(opcode, key_id, data),
-            OpcodeType::Data => panic!("Not implemented"),
+            OpcodeType::Data => Self::parse_data_packet(opcode, key_id, data),
         }
     }
 
@@ -260,6 +294,17 @@ impl Packet {
         Ok(Self::Control(control_packet))
     }
 
+    fn parse_data_packet(opcode: Opcode, key_id: u8, data: &[u8]) -> Result<Packet, PacketError> {
+        if data.len() < 28 {
+            return Err(PacketError::with_message("Packet too short."));
+        }
+        Ok(Packet::Data(DataChannelPacket {
+            opcode,
+            key_id,
+            packet_data: data.to_vec(),
+        }))
+    }
+
     /// Write the packet in the wire format to a buffer.
     pub fn to_buffer(&self, buffer: &mut [u8]) -> Result<usize, PacketError> {
         match self {
@@ -272,34 +317,6 @@ impl Packet {
         match self {
             Self::Control(p) => p.opcode,
             Self::Data(p) => p.opcode,
-        }
-    }
-
-    pub fn get_session_id(&self) -> u64 {
-        match self {
-            Self::Control(p) => p.session_id,
-            Self::Data(p) => p.session_id,
-        }
-    }
-
-    pub fn get_acks(&self) -> &[u32] {
-        match self {
-            Self::Control(p) => &p.acks,
-            Self::Data(_) => &[],
-        }
-    }
-
-    pub fn get_packet_id(&self) -> Option<u32> {
-        match self {
-            Self::Control(p) => p.packet_id,
-            Self::Data(p) => None,
-        }
-    }
-
-    pub fn get_payload(&self) -> &[u8] {
-        match self {
-            Self::Control(p) => &p.payload,
-            Self::Data(p) => &p.payload,
         }
     }
 }

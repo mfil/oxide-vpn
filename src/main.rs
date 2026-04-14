@@ -25,7 +25,8 @@ mod retransmit;
 
 use control_channel::ControlChannel;
 use control_channel::messages::{IvProto, PeerInfo};
-use packets::{ControlChannelPacket, Packet};
+use data_channel::{AES_256_GCM, DataChannel};
+use packets::{ControlChannelPacket, DataChannelPacket, Packet};
 
 #[derive(Debug)]
 struct E {}
@@ -39,6 +40,68 @@ impl fmt::Display for E {
 impl Error for E {}
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn print_packet(data: &[u8]) {
+    println!("\nDecrypted IP packet");
+    if data.len() < 20 {
+        println!("Packet too small");
+        return;
+    }
+
+    if data[0] >> 4 != 4 {
+        println!("Not an IPv4 packet");
+        return;
+    }
+    let header_length = (data[0] & 0x0f) as usize * size_of::<u32>();
+    println!("IP header length = {}", header_length);
+    let (_, rest) = data.split_at(2);
+    let (total_length_bytes, rest) = rest.split_first_chunk::<2>().unwrap();
+    let total_length = u16::from_be_bytes(*total_length_bytes) as usize;
+    if total_length < header_length {
+        println!("Invalid packet length");
+        return;
+    }
+    println!("Total packet length = {}", total_length);
+
+    let (_, rest) = rest.split_at(5);
+    let (protocol_byte, rest) = rest.split_first().unwrap();
+    match protocol_byte {
+        1 => println!("ICMP packet"),
+        2 => println!("IGMP packet"),
+        6 => println!("TCP packet"),
+        17 => println!("UDP packet"),
+        _ => println!("Other packet"),
+    };
+
+    let (_, rest) = rest.split_at(2);
+    let (source_addr_bytes, rest) = rest.split_first_chunk::<4>().unwrap();
+    println!(
+        "Source address = {}.{}.{}.{}",
+        source_addr_bytes[0], source_addr_bytes[1], source_addr_bytes[2], source_addr_bytes[3]
+    );
+    let (dest_addr_bytes, rest) = rest.split_first_chunk::<4>().unwrap();
+    println!(
+        "Destination address = {}.{}.{}.{}",
+        dest_addr_bytes[0], dest_addr_bytes[1], dest_addr_bytes[2], dest_addr_bytes[3]
+    );
+
+    let (_, payload) = rest.split_at(header_length - 20);
+    if *protocol_byte == 17 {
+        let (source_port_bytes, rest) = payload.split_first_chunk::<2>().unwrap();
+        println!("Source port: {}", u16::from_be_bytes(*source_port_bytes));
+        let (dest_port_bytes, rest) = rest.split_first_chunk::<2>().unwrap();
+        println!("Dest port: {}", u16::from_be_bytes(*dest_port_bytes));
+
+        let (_, rest) = rest.split_at(4);
+        println!("Valid UTF8 chunks from the packet body:");
+        for chunk in rest.utf8_chunks() {
+            println!("{}", chunk.valid());
+            if chunk.invalid().len() > 0 {
+                println!("{} non-UTF8 bytes", chunk.invalid().len());
+            }
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Hello, world!");
@@ -70,6 +133,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (incoming_send, control_receive) = channel::<ControlChannelPacket>();
     let (control_send, outgoing_receive) = channel();
+    let (incoming_data_send, incoming_data_receive) = channel::<DataChannelPacket>();
 
     let mut control_channel = ControlChannel::new(
         &mut rng(),
@@ -87,12 +151,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         let socket = socket_read;
         let mut read_buffer: [u8; 3000] = [0; 3000];
         let send_channel = incoming_send;
+        let send_data_channel = incoming_data_send;
         while !SHUTDOWN.load(Ordering::Relaxed) {
             let length = socket.recv(&mut read_buffer)?;
             let packet = Packet::parse(&read_buffer[..length]).unwrap();
-            if let Packet::Control(p) = packet {
-                println!("{}", p.key_id);
-                send_channel.send(p).unwrap();
+            match packet {
+                Packet::Control(p) => send_channel.send(p).unwrap(),
+                Packet::Data(p) => send_data_channel.send(p).unwrap(),
             }
         }
         Ok(())
@@ -135,15 +200,41 @@ fn main() -> Result<(), Box<dyn Error>> {
     let length = peer_info.to_buffer(&mut rng(), &mut write_buffer);
     control_channel.write(&write_buffer[..length])?;
     control_channel.flush()?;
+    let mut got_key_exchange = false;
+    let mut got_push_reply = false;
     while !SHUTDOWN.load(Ordering::Relaxed) {
-        if let Ok(length) = control_channel.read(&mut read_buffer) {
-            println!("{:?}", &read_buffer[..length]);
+        while !got_key_exchange {
+            if let Ok(length) = control_channel.read(&mut read_buffer) {
+                if length > 5 && read_buffer[..5] == [0, 0, 0, 0, 2] {
+                    got_key_exchange = true;
+                }
+            }
+            thread::sleep(std::time::Duration::from_secs(1));
         }
-        thread::sleep(std::time::Duration::from_secs(3));
-        if count > 10 {
-            SHUTDOWN.store(true, Ordering::Relaxed);
+        control_channel.write(b"PUSH_REQUEST")?;
+        control_channel.flush()?;
+        while !got_push_reply {
+            if let Ok(length) = control_channel.read(&mut read_buffer) {
+                let reply_str = b"PUSH_REPLY";
+                if length >= reply_str.len() && read_buffer[..reply_str.len()] == reply_str[..] {
+                    got_push_reply = true;
+                    println!("{}", str::from_utf8(&read_buffer[..length]).unwrap());
+                }
+            }
+            thread::sleep(std::time::Duration::from_secs(1));
         }
-        count += 1;
+        let data_channel_keys = control_channel.derive_data_channel_keys().unwrap();
+        let mut data_channel = DataChannel::new(
+            [0, 0, 0],
+            AES_256_GCM,
+            data_channel_keys.client_to_server,
+            data_channel_keys.server_to_client,
+        );
+        loop {
+            let packet = incoming_data_receive.recv().unwrap();
+            let decrypted = data_channel.decrypt_packet(packet).unwrap();
+            print_packet(&decrypted);
+        }
     }
 
     socket_write_thread.join().unwrap()?;
