@@ -180,7 +180,7 @@ impl ControlChannelPacket {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DataChannelPacket {
     pub opcode: Opcode,
     pub key_id: u8,
@@ -196,6 +196,13 @@ impl DataChannelPacket {
     }
 
     const PACKET_ID_OFFSET: usize = Self::PEER_ID_OFFSET + 3;
+    pub fn get_epoch(&self) -> u16 {
+        u16::from_be_bytes([
+            self.packet_data[Self::PACKET_ID_OFFSET],
+            self.packet_data[Self::PACKET_ID_OFFSET + 1],
+        ])
+    }
+
     pub fn get_packet_id(&self) -> &[u8; 8] {
         self.packet_data[Self::PACKET_ID_OFFSET..]
             .first_chunk::<8>()
