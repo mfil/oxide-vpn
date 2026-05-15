@@ -1,4 +1,5 @@
 extern crate bitflags;
+extern crate libc;
 extern crate memsec;
 extern crate openssl;
 extern crate rand;
@@ -21,12 +22,13 @@ use rand::rng;
 mod control_channel;
 mod data_channel;
 mod packets;
+mod poll;
 mod retransmit;
 
 use control_channel::ControlChannel;
 use control_channel::messages::{IvProto, PeerInfo};
 use data_channel::{AES_256_GCM, DataChannel};
-use packets::{ControlChannelPacket, DataChannelPacket, Packet};
+use packets::{ControlChannelPacket, DataChannelPacket, Packet, PacketError};
 
 #[derive(Debug)]
 struct E {}
@@ -40,6 +42,12 @@ impl fmt::Display for E {
 impl Error for E {}
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn receive_packet(socket: &UdpSocket) -> Result<Packet, PacketError> {
+    let mut read_buffer: [u8; 3000] = [0; 3000];
+    let length = socket.recv(&mut read_buffer).unwrap();
+    Packet::parse(&read_buffer[..length])
+}
 
 fn print_packet(data: &[u8]) {
     println!("\nDecrypted IP packet");
@@ -131,9 +139,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     socket.connect((address, port))?;
     println!("Connected to {}:{}", &args[1][..], port);
 
-    let (incoming_send, control_receive) = channel::<ControlChannelPacket>();
     let (control_send, outgoing_receive) = channel();
-    let (incoming_data_send, incoming_data_receive) = channel::<DataChannelPacket>();
 
     let mut control_channel = ControlChannel::new(
         &mut rng(),
@@ -142,26 +148,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         X509::from_pem(&cert_pem)?,
         PKey::private_key_from_pem(&key_pem)?,
         "Oxide VPN Test Server",
-        control_receive,
-        control_send,
+        |packet| control_send.send(packet).unwrap(),
     );
 
-    let socket_read = socket.try_clone()?;
-    let socket_read_thread = thread::spawn(move || -> std::io::Result<()> {
-        let socket = socket_read;
-        let mut read_buffer: [u8; 3000] = [0; 3000];
-        let send_channel = incoming_send;
-        let send_data_channel = incoming_data_send;
-        while !SHUTDOWN.load(Ordering::Relaxed) {
-            let length = socket.recv(&mut read_buffer)?;
-            let packet = Packet::parse(&read_buffer[..length]).unwrap();
-            match packet {
-                Packet::Control(p) => send_channel.send(p).unwrap(),
-                Packet::Data(p) => send_data_channel.send(p).unwrap(),
-            }
-        }
-        Ok(())
-    });
+    let mut poller = poll::SocketPoller::new(&socket);
 
     let socket_write = socket.try_clone()?;
     let socket_write_thread = thread::spawn(move || -> std::io::Result<()> {
@@ -182,12 +172,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let mut read_buffer: [u8; 3000] = [0; 3000];
-    let mut count = 0;
     control_channel.reset();
     while !control_channel.is_connected() {
-        control_channel.receive_packets();
-        control_channel.send_packets();
-        thread::sleep(std::time::Duration::from_millis(1));
+        poller.wait_for_data(-1, true).unwrap();
+        if poller.can_read_phys() {
+            let packet = receive_packet(&socket)?;
+            if let Packet::Control(p) = packet {
+                control_channel.receive_packet(p);
+            }
+        }
     }
     let peer_info = PeerInfo {
         iv_proto: IvProto::SUPPORT_DATA_V2
@@ -204,16 +197,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut got_push_reply = false;
     while !SHUTDOWN.load(Ordering::Relaxed) {
         while !got_key_exchange {
+            poller.wait_for_data(-1, true).unwrap();
+            if poller.can_read_phys() {
+                let packet = receive_packet(&socket)?;
+                if let Packet::Control(p) = packet {
+                    control_channel.receive_packet(p);
+                }
+            }
             if let Ok(length) = control_channel.read(&mut read_buffer) {
                 if length > 5 && read_buffer[..5] == [0, 0, 0, 0, 2] {
                     got_key_exchange = true;
                 }
             }
-            thread::sleep(std::time::Duration::from_secs(1));
         }
         control_channel.write(b"PUSH_REQUEST")?;
         control_channel.flush()?;
         while !got_push_reply {
+            poller.wait_for_data(0, true).unwrap();
+            if poller.can_read_phys() {
+                let packet = receive_packet(&socket)?;
+                if let Packet::Control(p) = packet {
+                    control_channel.receive_packet(p);
+                }
+            } else {
+                thread::sleep(std::time::Duration::from_secs(1));
+            }
             if let Ok(length) = control_channel.read(&mut read_buffer) {
                 let reply_str = b"PUSH_REPLY";
                 if length >= reply_str.len() && read_buffer[..reply_str.len()] == reply_str[..] {
@@ -221,7 +229,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("{}", str::from_utf8(&read_buffer[..length]).unwrap());
                 }
             }
-            thread::sleep(std::time::Duration::from_secs(1));
         }
         let data_channel_keys = control_channel.derive_data_channel_keys().unwrap();
         let mut data_channel = DataChannel::new(
@@ -231,14 +238,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             data_channel_keys.server_to_client,
         );
         loop {
-            let packet = incoming_data_receive.recv().unwrap();
-            let decrypted = data_channel.decrypt_packet(packet).unwrap();
-            print_packet(&decrypted);
+            poller.wait_for_data(-1, true).unwrap();
+            if poller.can_read_phys() {
+                let packet = receive_packet(&socket)?;
+                if let Packet::Data(p) = packet {
+                    let decrypted = data_channel.decrypt_packet(p).unwrap();
+                    print_packet(&decrypted);
+                }
+            }
         }
     }
 
     socket_write_thread.join().unwrap()?;
-    socket_read_thread.join().unwrap()?;
 
     Ok(())
 }
