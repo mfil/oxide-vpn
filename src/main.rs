@@ -23,6 +23,7 @@ mod error;
 mod packets;
 mod poll;
 mod retransmit;
+mod tun;
 
 use control_channel::ControlChannel;
 use control_channel::messages::{IvProto, PeerInfo};
@@ -38,75 +39,13 @@ fn receive_packet(socket: &UdpSocket) -> Result<Packet, Error> {
     Packet::parse(&read_buffer[..length])
 }
 
-fn print_packet(data: &[u8]) {
-    println!("\nDecrypted IP packet");
-    if data.len() < 20 {
-        println!("Packet too small");
-        return;
-    }
-
-    if data[0] >> 4 != 4 {
-        println!("Not an IPv4 packet");
-        return;
-    }
-    let header_length = (data[0] & 0x0f) as usize * size_of::<u32>();
-    println!("IP header length = {}", header_length);
-    let (_, rest) = data.split_at(2);
-    let (total_length_bytes, rest) = rest.split_first_chunk::<2>().unwrap();
-    let total_length = u16::from_be_bytes(*total_length_bytes) as usize;
-    if total_length < header_length {
-        println!("Invalid packet length");
-        return;
-    }
-    println!("Total packet length = {}", total_length);
-
-    let (_, rest) = rest.split_at(5);
-    let (protocol_byte, rest) = rest.split_first().unwrap();
-    match protocol_byte {
-        1 => println!("ICMP packet"),
-        2 => println!("IGMP packet"),
-        6 => println!("TCP packet"),
-        17 => println!("UDP packet"),
-        _ => println!("Other packet"),
-    };
-
-    let (_, rest) = rest.split_at(2);
-    let (source_addr_bytes, rest) = rest.split_first_chunk::<4>().unwrap();
-    println!(
-        "Source address = {}.{}.{}.{}",
-        source_addr_bytes[0], source_addr_bytes[1], source_addr_bytes[2], source_addr_bytes[3]
-    );
-    let (dest_addr_bytes, rest) = rest.split_first_chunk::<4>().unwrap();
-    println!(
-        "Destination address = {}.{}.{}.{}",
-        dest_addr_bytes[0], dest_addr_bytes[1], dest_addr_bytes[2], dest_addr_bytes[3]
-    );
-
-    let (_, payload) = rest.split_at(header_length - 20);
-    if *protocol_byte == 17 {
-        let (source_port_bytes, rest) = payload.split_first_chunk::<2>().unwrap();
-        println!("Source port: {}", u16::from_be_bytes(*source_port_bytes));
-        let (dest_port_bytes, rest) = rest.split_first_chunk::<2>().unwrap();
-        println!("Dest port: {}", u16::from_be_bytes(*dest_port_bytes));
-
-        let (_, rest) = rest.split_at(4);
-        println!("Valid UTF8 chunks from the packet body:");
-        for chunk in rest.utf8_chunks() {
-            println!("{}", chunk.valid());
-            if chunk.invalid().len() > 0 {
-                println!("{} non-UTF8 bytes", chunk.invalid().len());
-            }
-        }
-    }
-}
-
 fn main() -> Result<(), Error> {
     println!("Hello, world!");
     let args = std::vec::Vec::from_iter(env::args());
     if args.len() < 6 {
         return Result::Err(Error::argument_error("Expected 6 command line arguments"));
     }
-    let socket = UdpSocket::bind(("127.0.0.1", 50000))?;
+    let socket = UdpSocket::bind(("0.0.0.0", 0))?;
     let address = &args[1][..];
     let port =
         u16::from_str_radix(&args[2], 10).map_err(|_| Error::argument_error("bad port number"))?;
@@ -125,6 +64,8 @@ fn main() -> Result<(), Error> {
     let mut key_file = File::open(key_path)?;
     let mut key_pem = Vec::new();
     let _ = key_file.read_to_end(&mut key_pem);
+
+    let mut tun = tun::Tun::open(b"foo")?;
 
     socket.connect((address, port))?;
     println!("Connected to {}:{}", &args[1][..], port);
@@ -149,14 +90,15 @@ fn main() -> Result<(), Error> {
         let mut write_buffer: [u8; 3000] = [0; 3000];
         let receive_channel = outgoing_receive;
         while !SHUTDOWN.load(Ordering::Relaxed) {
-            let packet = receive_channel.recv().unwrap();
-            if packet.opcode != crate::packets::Opcode::ControlHardResetClientV2
-                && packet.peer_session_id.is_none()
-            {
-                println!("oh no");
+            if let Ok(packet) = receive_channel.recv() {
+                if packet.opcode != crate::packets::Opcode::ControlHardResetClientV2
+                    && packet.peer_session_id.is_none()
+                {
+                    println!("oh no");
+                }
+                let length = packet.to_buffer(&mut write_buffer).unwrap();
+                socket.send(&write_buffer[..length])?;
             }
-            let length = packet.to_buffer(&mut write_buffer).unwrap();
-            socket.send(&write_buffer[..length])?;
         }
         Ok(())
     });
@@ -177,7 +119,7 @@ fn main() -> Result<(), Error> {
             | IvProto::EXPECT_PUSH_REPLY
             | IvProto::CAN_DO_KEY_MAT_EXPORT
             | IvProto::EPOCH_DATA_FORMAT,
-        iv_ciphers: "AES-256-GCM:CHACHA20-POLY1305",
+        iv_ciphers: "AES-256-GCM",
     };
     let mut write_buffer: [u8; 2000] = [0; 2000];
     let length = peer_info.to_buffer(&mut rng(), &mut write_buffer);
@@ -233,7 +175,7 @@ fn main() -> Result<(), Error> {
                 let packet = receive_packet(&socket)?;
                 if let Packet::Data(p) = packet {
                     let decrypted = data_channel.decrypt_packet(p).unwrap();
-                    print_packet(&decrypted);
+                    tun.write(&decrypted)?;
                 }
             }
         }

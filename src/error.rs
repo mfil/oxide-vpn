@@ -7,9 +7,11 @@ use std::io;
 pub enum Error {
     MalformedPacket(String),
     InvalidArgument(String),
+    PermissionDenied(String),
     Handshake(String),
     Io(io::Error),
     Ssl(openssl::error::ErrorStack),
+    Unknown(String),
 }
 
 impl fmt::Display for Error {
@@ -17,9 +19,11 @@ impl fmt::Display for Error {
         match self {
             Error::MalformedPacket(s) => write!(formatter, "Received bad OpenVPN packet: {}", s),
             Error::InvalidArgument(s) => write!(formatter, "Invalid argument: {}", s),
+            Error::PermissionDenied(s) => write!(formatter, "Permission denied: {}", s),
             Error::Handshake(s) => write!(formatter, "Handshake failed: {}", s),
             Error::Io(e) => write!(formatter, "IO Error: {}", e),
             Error::Ssl(e) => write!(formatter, "OpenSSL Error: {}", e),
+            Error::Unknown(s) => write!(formatter, "Unknown error: {}", s),
         }
     }
 }
@@ -31,6 +35,10 @@ impl Error {
 
     pub fn argument_error<S: Into<String>>(message: S) -> Self {
         Error::InvalidArgument(message.into())
+    }
+
+    pub fn permission_error<S: Into<String>>(message: S) -> Self {
+        Error::PermissionDenied(message.into())
     }
 }
 

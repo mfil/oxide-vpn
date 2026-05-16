@@ -96,6 +96,10 @@ impl DataChannel {
         let packet_epoch = packet.get_epoch();
 
         if self.decryption_key.epoch > packet_epoch {
+            println!(
+                "bad epoch: {}, own epoch: {}",
+                packet_epoch, self.decryption_key.epoch
+            );
             return None;
         }
 
