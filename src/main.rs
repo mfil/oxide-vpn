@@ -5,8 +5,6 @@ extern crate openssl;
 extern crate rand;
 
 use std::env;
-use std::error::Error;
-use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::UdpSocket;
@@ -21,6 +19,7 @@ use rand::rng;
 
 mod control_channel;
 mod data_channel;
+mod error;
 mod packets;
 mod poll;
 mod retransmit;
@@ -28,22 +27,12 @@ mod retransmit;
 use control_channel::ControlChannel;
 use control_channel::messages::{IvProto, PeerInfo};
 use data_channel::{AES_256_GCM, DataChannel};
-use packets::{ControlChannelPacket, DataChannelPacket, Packet, PacketError};
-
-#[derive(Debug)]
-struct E {}
-
-impl fmt::Display for E {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "")
-    }
-}
-
-impl Error for E {}
+use error::Error;
+use packets::Packet;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-fn receive_packet(socket: &UdpSocket) -> Result<Packet, PacketError> {
+fn receive_packet(socket: &UdpSocket) -> Result<Packet, Error> {
     let mut read_buffer: [u8; 3000] = [0; 3000];
     let length = socket.recv(&mut read_buffer).unwrap();
     Packet::parse(&read_buffer[..length])
@@ -111,15 +100,16 @@ fn print_packet(data: &[u8]) {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Error> {
     println!("Hello, world!");
     let args = std::vec::Vec::from_iter(env::args());
     if args.len() < 6 {
-        return Result::Err(Box::new(E {}));
+        return Result::Err(Error::argument_error("Expected 6 command line arguments"));
     }
     let socket = UdpSocket::bind(("127.0.0.1", 50000))?;
     let address = &args[1][..];
-    let port = u16::from_str_radix(&args[2], 10)?;
+    let port =
+        u16::from_str_radix(&args[2], 10).map_err(|_| Error::argument_error("bad port number"))?;
     let ca_path = Path::new(&args[3]);
     let cert_path = Path::new(&args[4]);
     let key_path = Path::new(&args[5]);
@@ -178,7 +168,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if poller.can_read_phys() {
             let packet = receive_packet(&socket)?;
             if let Packet::Control(p) = packet {
-                control_channel.receive_packet(p);
+                control_channel.receive_packet(p)?;
             }
         }
     }
@@ -201,7 +191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if poller.can_read_phys() {
                 let packet = receive_packet(&socket)?;
                 if let Packet::Control(p) = packet {
-                    control_channel.receive_packet(p);
+                    control_channel.receive_packet(p)?;
                 }
             }
             if let Ok(length) = control_channel.read(&mut read_buffer) {
@@ -217,7 +207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if poller.can_read_phys() {
                 let packet = receive_packet(&socket)?;
                 if let Packet::Control(p) = packet {
-                    control_channel.receive_packet(p);
+                    control_channel.receive_packet(p)?;
                 }
             } else {
                 thread::sleep(std::time::Duration::from_secs(1));

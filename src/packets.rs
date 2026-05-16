@@ -1,33 +1,6 @@
 //! This module defines the different packet types used in OpenVPN and contains functions for parsing them.
-use std::convert::From;
-use std::error::Error;
-use std::fmt;
+use crate::error::Error;
 use std::iter::zip;
-
-#[derive(Debug)]
-pub struct PacketError {
-    message: &'static str,
-}
-
-impl fmt::Display for PacketError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Parse error: {}", self.message)
-    }
-}
-
-impl Error for PacketError {}
-
-impl PacketError {
-    fn with_message(message: &'static str) -> Self {
-        PacketError { message }
-    }
-}
-
-impl From<&'static str> for PacketError {
-    fn from(message: &'static str) -> Self {
-        PacketError::with_message(message)
-    }
-}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum OpcodeType {
@@ -51,7 +24,7 @@ pub enum Opcode {
 }
 
 impl TryFrom<u8> for Opcode {
-    type Error = PacketError;
+    type Error = Error;
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
         match byte {
             4 => Ok(Opcode::ControlV1),
@@ -59,7 +32,7 @@ impl TryFrom<u8> for Opcode {
             7 => Ok(Opcode::ControlHardResetClientV2),
             8 => Ok(Opcode::ControlHardResetServerV2),
             9 => Ok(Opcode::DataV2),
-            _ => Err(PacketError::with_message("Invalid opcode")),
+            _ => Err(Error::packet_error("Invalid opcode")),
         }
     }
 }
@@ -106,46 +79,44 @@ impl ControlChannelPacket {
     }
 
     /// Write the packet in wire format to a buffer.
-    pub fn to_buffer(&self, buffer: &mut [u8]) -> Result<usize, PacketError> {
+    pub fn to_buffer(&self, buffer: &mut [u8]) -> Result<usize, Error> {
         // Check that the packet is valid.
         if self.opcode.get_type() != OpcodeType::Control {
-            return Err(PacketError::with_message("Bad opcode"));
+            return Err(Error::packet_error("Bad opcode"));
         }
         if self.key_id > 7 {
-            return Err(PacketError::with_message("Key ID too large"));
+            return Err(Error::packet_error("Key ID too large"));
         }
         if self.opcode.is_ack() {
             if self.packet_id.is_some() {
-                return Err(PacketError::with_message(
-                    "Ack packets don't have packet IDs.",
-                ));
+                return Err(Error::packet_error("Ack packets don't have packet IDs."));
             }
             if self.acks.len() > 8 {
-                return Err(PacketError::with_message(
+                return Err(Error::packet_error(
                     "ControlAckV1 packets can have at most 8 acks.",
                 ));
             }
         } else {
             if self.packet_id.is_none() {
-                return Err(PacketError::with_message(
+                return Err(Error::packet_error(
                     "Control channel packets must have packet IDs.",
                 ));
             }
             if self.acks.len() > 4 {
-                return Err(PacketError::with_message(
+                return Err(Error::packet_error(
                     "Control channel packets can have at most 4 acks.",
                 ));
             }
         }
         if self.acks.len() > 0 && self.peer_session_id.is_none() {
-            return Err(PacketError::with_message(
+            return Err(Error::packet_error(
                 "Control channel packets must have a peer session ID if they have acks.",
             ));
         }
 
         let size = self.size();
         if buffer.len() < size {
-            return Err(PacketError::with_message("Buffer too small"));
+            return Err(Error::packet_error("Buffer too small"));
         }
         buffer[0] = ((self.opcode as u8) << 3) | self.key_id;
         let (session_id_buffer, rest) = buffer[1..].split_first_chunk_mut::<8>().unwrap();
@@ -232,10 +203,8 @@ pub enum Packet {
 }
 
 impl Packet {
-    pub fn parse(data: &[u8]) -> Result<Packet, PacketError> {
-        let first_byte = data
-            .get(0)
-            .ok_or(PacketError::with_message("Empty packet"))?;
+    pub fn parse(data: &[u8]) -> Result<Packet, Error> {
+        let first_byte = data.get(0).ok_or(Error::packet_error("Empty packet"))?;
         let opcode = Opcode::try_from(first_byte >> 3)?;
         let key_id = first_byte & 0x07;
         match opcode.get_type() {
@@ -244,22 +213,18 @@ impl Packet {
         }
     }
 
-    fn parse_control_packet(
-        opcode: Opcode,
-        key_id: u8,
-        data: &[u8],
-    ) -> Result<Packet, PacketError> {
+    fn parse_control_packet(opcode: Opcode, key_id: u8, data: &[u8]) -> Result<Packet, Error> {
         let (session_id_bytes, rest) = data[1..]
             .split_first_chunk::<8>()
-            .ok_or("Control channel packet too short.")?;
+            .ok_or_else(|| Error::packet_error("Control channel packet too short."))?;
         let session_id = u64::from_be_bytes(*session_id_bytes);
         let (num_acks_byte, rest) = rest
             .split_first()
-            .ok_or("Control channel packet too short.")?;
+            .ok_or_else(|| Error::packet_error("Control channel packet too short."))?;
         let num_acks = *num_acks_byte as usize;
         let (acks_portion, rest) = rest
             .split_at_checked(num_acks * size_of::<u32>())
-            .ok_or("Control channel packet too short.")?;
+            .ok_or_else(|| Error::packet_error("Control channel packet too short."))?;
         let (ack_chunks, _) = acks_portion.as_chunks::<4>();
 
         let mut acks = Vec::<u32>::with_capacity(num_acks);
@@ -271,7 +236,7 @@ impl Packet {
         let (peer_session_id, rest) = if num_acks > 0 {
             let (peer_session_id_bytes, rest) = rest
                 .split_first_chunk::<8>()
-                .ok_or("Control channel packet too short.")?;
+                .ok_or_else(|| Error::packet_error("Control channel packet too short."))?;
             let peer_session_id = u64::from_be_bytes(*peer_session_id_bytes);
             (Some(peer_session_id), rest)
         } else {
@@ -282,7 +247,7 @@ impl Packet {
         let (packet_id, payload) = if !opcode.is_ack() {
             let (packet_id_bytes, rest) = rest
                 .split_first_chunk::<4>()
-                .ok_or("Control channel packet too short.")?;
+                .ok_or_else(|| Error::packet_error("Control channel packet too short."))?;
             let packet_id = u32::from_be_bytes(*packet_id_bytes);
             (Some(packet_id), rest)
         } else {
@@ -301,9 +266,9 @@ impl Packet {
         Ok(Self::Control(control_packet))
     }
 
-    fn parse_data_packet(opcode: Opcode, key_id: u8, data: &[u8]) -> Result<Packet, PacketError> {
+    fn parse_data_packet(opcode: Opcode, key_id: u8, data: &[u8]) -> Result<Packet, Error> {
         if data.len() < 28 {
-            return Err(PacketError::with_message("Packet too short."));
+            return Err(Error::packet_error("Packet too short."));
         }
         Ok(Packet::Data(DataChannelPacket {
             opcode,
@@ -313,7 +278,7 @@ impl Packet {
     }
 
     /// Write the packet in the wire format to a buffer.
-    pub fn to_buffer(&self, buffer: &mut [u8]) -> Result<usize, PacketError> {
+    pub fn to_buffer(&self, buffer: &mut [u8]) -> Result<usize, Error> {
         match self {
             Self::Control(control_packet) => control_packet.to_buffer(buffer),
             Self::Data(_) => panic!("Not implemented"),

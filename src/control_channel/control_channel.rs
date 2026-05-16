@@ -18,6 +18,7 @@ use super::control_channel_state::ControlChannelState;
 use super::tls_record_stream::TlsRecordStream;
 
 use crate::data_channel::{DataChannelKeys, EpochKey};
+use crate::error::Error;
 use crate::packets::{ControlChannelPacket, Opcode};
 
 #[derive(Debug)]
@@ -199,7 +200,7 @@ impl<F: Fn(ControlChannelPacket)> ControlChannel<F> {
     /// If the handshake is completed, the decrypted data can be read with [`read`].
     ///
     /// If many packets are received without sending one, this method may also send out ACK packets.
-    pub fn receive_packet(&mut self, packet: ControlChannelPacket) {
+    pub fn receive_packet(&mut self, packet: ControlChannelPacket) -> Result<(), Error> {
         // TODO: Need to handle out of order packets.
         self.state.process_packet(&packet);
 
@@ -217,14 +218,15 @@ impl<F: Fn(ControlChannelPacket)> ControlChannel<F> {
             // TODO: Normal OpenVPN waits for the client to send the first ControlV1 packet
             // before establishing the session, to make DOS attacks harder. In the unlikely case
             // that anyone runs this for real, this should be fixed here.
-            self.begin_tls_handshake_server().unwrap();
+            self.begin_tls_handshake_server()?;
         } else if !self.is_server && packet.opcode == Opcode::ControlHardResetServerV2 {
-            self.begin_tls_handshake_client().unwrap();
+            self.begin_tls_handshake_client()?;
         } else if packet.opcode == Opcode::ControlV1 {
-            self.tls_session.insert_payload(packet.payload).unwrap();
+            self.tls_session.insert_payload(packet.payload)?;
         } else if packet.opcode == Opcode::ControlAckV1 {
         }
         self.send_packets();
+        Ok(())
     }
 
     /// Send out `ControlV1` packets with payloads produced by the TLS session.
@@ -452,10 +454,10 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         client.reset();
         while !client.is_connected() || !server.is_connected() {
             for packet in outgoing_packets_client.borrow_mut().drain(..) {
-                server.receive_packet(packet);
+                server.receive_packet(packet).unwrap();
             }
             for packet in outgoing_packets_server.borrow_mut().drain(..) {
-                client.receive_packet(packet);
+                client.receive_packet(packet).unwrap();
             }
         }
 
@@ -463,7 +465,7 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         let message1 = b"Geht der nich noch?";
         client.write(message1).unwrap();
         for packet in outgoing_packets_client.borrow_mut().drain(..) {
-            server.receive_packet(packet);
+            server.receive_packet(packet).unwrap();
         }
         let length = server.read(&mut read_buffer).unwrap();
         assert_eq!(message1, &read_buffer[..length]);
@@ -471,7 +473,7 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         let message2 = b"Der geht ja noch!";
         client.write(message2).unwrap();
         for packet in outgoing_packets_client.borrow_mut().drain(..) {
-            server.receive_packet(packet);
+            server.receive_packet(packet).unwrap();
         }
         let length = server.read(&mut read_buffer).unwrap();
         assert_eq!(message2, &read_buffer[..length]);
@@ -479,7 +481,7 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         let message3 = b"Tut das Not dass der hier so rumoxidiert?";
         client.write(message3).unwrap();
         for packet in outgoing_packets_client.borrow_mut().drain(..) {
-            server.receive_packet(packet);
+            server.receive_packet(packet).unwrap();
         }
         let length = server.read(&mut read_buffer).unwrap();
         assert_eq!(message3, &read_buffer[..length]);

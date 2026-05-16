@@ -1,34 +1,11 @@
 //! Contains the OpenVPN key derivation functions.
 
-use std::convert::From;
 use std::ops::Drop;
 
-use openssl::error::ErrorStack;
 use openssl::kdf::{HkdfMode, hkdf};
 use openssl::md::Md;
 
-#[derive(Debug)]
-pub enum Error {
-    InvalidArgument,
-    SslError(ErrorStack),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        match self {
-            Self::InvalidArgument => write!(formatter, "Invalid argument"),
-            Self::SslError(e) => write!(formatter, "SSL Error: {}", e),
-        }
-    }
-}
-
-impl From<ErrorStack> for Error {
-    fn from(e: ErrorStack) -> Self {
-        Self::SslError(e)
-    }
-}
-
-impl std::error::Error for Error {}
+use crate::error::Error;
 
 pub struct DataChannelKeys {
     pub client_to_server: EpochKey,
@@ -58,7 +35,9 @@ fn ovpn_expand_label(
         return Ok(());
     }
     if out.len() > u16::max_value() as usize || label.len() > 250 || context.len() > 255 {
-        return Err(Error::InvalidArgument);
+        return Err(Error::argument_error(
+            "Invalid arguments to ovpn_expand_label",
+        ));
     }
     let mut hkdf_input = Vec::<u8>::new();
     hkdf_input.extend_from_slice(&(out.len() as u16).to_be_bytes());
