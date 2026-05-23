@@ -53,7 +53,7 @@ impl Opcode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ControlChannelPacket {
     pub opcode: Opcode,
     pub key_id: u8,
@@ -216,10 +216,19 @@ impl DataChannelPacket {
             packet_data,
         })
     }
+
+    pub fn to_buffer(&self, buffer: &mut [u8]) -> Result<usize, Error> {
+        let packet_length = self.packet_data.len();
+        if buffer.len() < packet_length {
+            return Err(Error::BufferTooSmall);
+        }
+        buffer[..packet_length].copy_from_slice(&self.packet_data);
+        Ok(packet_length)
+    }
 }
 
 /// OpenVPN UDP packet.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Packet {
     Control(ControlChannelPacket),
     Data(DataChannelPacket),
@@ -304,7 +313,7 @@ impl Packet {
     pub fn to_buffer(&self, buffer: &mut [u8]) -> Result<usize, Error> {
         match self {
             Self::Control(control_packet) => control_packet.to_buffer(buffer),
-            Self::Data(_) => panic!("Not implemented"),
+            Self::Data(data_packet) => data_packet.to_buffer(buffer),
         }
     }
 

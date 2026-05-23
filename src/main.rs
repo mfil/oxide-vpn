@@ -5,14 +5,14 @@ extern crate memsec;
 extern crate openssl;
 extern crate rand;
 
-use std::env;
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
 use std::thread;
+use std::{env, io};
 
 use clap::Parser;
 use openssl::pkey::PKey;
@@ -32,8 +32,6 @@ use control_channel::messages::{IvProto, PeerInfo};
 use data_channel::{AES_256_GCM, DataChannel};
 use error::Error;
 use packets::Packet;
-
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[clap(name = "OxideVPN", version = "0.1.0", author = "Max Fillinger")]
@@ -59,6 +57,10 @@ struct Args {
     #[arg(long)]
     key: String,
 
+    /// Common name of the server's certificate.
+    #[arg(long, default_value = "Oxide VPN Test Server")]
+    peer_name: String,
+
     /// Name of the tun interface to use.
     #[arg(long, default_value = "")]
     tun: String,
@@ -68,6 +70,14 @@ fn receive_packet(socket: &UdpSocket) -> Result<Packet, Error> {
     let mut read_buffer: [u8; 3000] = [0; 3000];
     let length = socket.recv(&mut read_buffer).unwrap();
     Packet::parse(&read_buffer[..length])
+}
+
+#[derive(PartialEq, Eq)]
+enum ConnectionState {
+    Uninitialized,
+    HandshakeDone,
+    ReceivedKeyExchange,
+    ReceivedOptions,
 }
 
 fn main() -> Result<(), Error> {
@@ -90,118 +100,133 @@ fn main() -> Result<(), Error> {
 
     socket.connect((args.remote, args.port))?;
 
-    let (control_send, outgoing_receive) = channel();
-
+    let net_send_queue = RefCell::new(Vec::<Packet>::new());
     let mut control_channel = ControlChannel::new(
         &mut rng(),
         false,
         X509::from_pem(&ca_pem)?,
         X509::from_pem(&cert_pem)?,
         PKey::private_key_from_pem(&key_pem)?,
-        "Oxide VPN Test Server",
-        |packet| control_send.send(packet).unwrap(),
+        args.peer_name,
+        |packet| net_send_queue.borrow_mut().push(Packet::Control(packet)),
     );
+    let mut data_channel: Option<DataChannel> = None;
 
     let mut poller = poll::SocketPoller::new(&socket, &tun);
-
-    let socket_write = socket.try_clone()?;
-    let socket_write_thread = thread::spawn(move || -> std::io::Result<()> {
-        let socket = socket_write;
-        let mut write_buffer: [u8; 3000] = [0; 3000];
-        let receive_channel = outgoing_receive;
-        while !SHUTDOWN.load(Ordering::Relaxed) {
-            if let Ok(packet) = receive_channel.recv() {
-                if packet.opcode != crate::packets::Opcode::ControlHardResetClientV2
-                    && packet.peer_session_id.is_none()
-                {
-                    println!("oh no");
-                }
-                let length = packet.to_buffer(&mut write_buffer).unwrap();
-                socket.send(&write_buffer[..length])?;
-            }
-        }
-        Ok(())
-    });
+    let mut state = ConnectionState::Uninitialized;
 
     let mut read_buffer: [u8; 3000] = [0; 3000];
+    let mut write_buffer: [u8; 3000] = [0; 3000];
+
     control_channel.reset();
-    while !control_channel.is_connected() {
-        let poll_result = poller.poll(-1, true).unwrap();
+    control_channel.send_packets();
+    let packet = net_send_queue.borrow_mut().pop().unwrap();
+    let length = packet.to_buffer(&mut write_buffer)?;
+    socket.send(&write_buffer[..length])?;
+    socket.set_nonblocking(true)?;
+
+    loop {
+        let poll_result = poller.poll(-1, true)?;
+
         if poll_result.can_read_network {
             let packet = receive_packet(&socket)?;
-            if let Packet::Control(p) = packet {
-                control_channel.receive_packet(p)?;
-            }
-        }
-    }
-    let peer_info = PeerInfo {
-        iv_proto: IvProto::SUPPORT_DATA_V2
-            | IvProto::EXPECT_PUSH_REPLY
-            | IvProto::CAN_DO_KEY_MAT_EXPORT
-            | IvProto::EPOCH_DATA_FORMAT,
-        iv_ciphers: "AES-256-GCM",
-    };
-    let mut write_buffer: [u8; 2000] = [0; 2000];
-    let length = peer_info.to_buffer(&mut rng(), &mut write_buffer);
-    control_channel.write(&write_buffer[..length])?;
-    control_channel.flush()?;
-    let mut got_key_exchange = false;
-    let mut got_push_reply = false;
-    while !SHUTDOWN.load(Ordering::Relaxed) {
-        while !got_key_exchange {
-            let poll_result = poller.poll(-1, true).unwrap();
-            if poll_result.can_read_network {
-                let packet = receive_packet(&socket)?;
-                if let Packet::Control(p) = packet {
-                    control_channel.receive_packet(p)?;
+            match packet {
+                Packet::Control(p) => control_channel.receive_packet(p)?,
+                Packet::Data(p) => {
+                    if let Some(data_channel) = &mut data_channel {
+                        let decrypted_packet = data_channel.decrypt_packet(p).unwrap();
+                        tun.write(&decrypted_packet)?;
+                    } else {
+                        println!("Received data channel packet before it is ready, ignoring.");
+                    }
                 }
             }
+        }
+
+        if poll_result.can_read_tun {
+            if let Some(data_channel) = &mut data_channel {
+                let length = tun.read(&mut read_buffer)?;
+                let encrypted_packet = data_channel.encrypt_packet(&read_buffer[..length])?;
+                net_send_queue
+                    .borrow_mut()
+                    .push(Packet::Data(encrypted_packet));
+            } else {
+                println!(
+                    "tun interface received packets before the data channel is ready, ignoring."
+                );
+            }
+        }
+
+        if state == ConnectionState::Uninitialized {
+            if control_channel.is_connected() {
+                state = ConnectionState::HandshakeDone;
+                let peer_info = PeerInfo {
+                    iv_proto: IvProto::SUPPORT_DATA_V2
+                        | IvProto::EXPECT_PUSH_REPLY
+                        | IvProto::CAN_DO_KEY_MAT_EXPORT
+                        | IvProto::EPOCH_DATA_FORMAT,
+                    iv_ciphers: "AES-256-GCM",
+                };
+                let length = peer_info.to_buffer(&mut rng(), &mut write_buffer);
+                control_channel.write(&write_buffer[..length])?;
+                control_channel.flush()?;
+            }
+        } else if state == ConnectionState::HandshakeDone {
             if let Ok(length) = control_channel.read(&mut read_buffer) {
                 if length > 5 && read_buffer[..5] == [0, 0, 0, 0, 2] {
-                    got_key_exchange = true;
+                    state = ConnectionState::ReceivedKeyExchange;
+                    control_channel.write(b"PUSH_REQUEST")?;
+                    control_channel.flush()?;
                 }
             }
-        }
-        control_channel.write(b"PUSH_REQUEST")?;
-        control_channel.flush()?;
-        while !got_push_reply {
-            let poll_result = poller.poll(-1, true).unwrap();
-            if poll_result.can_read_network {
-                let packet = receive_packet(&socket)?;
-                if let Packet::Control(p) = packet {
-                    control_channel.receive_packet(p)?;
-                }
-            } else {
-                thread::sleep(std::time::Duration::from_secs(1));
-            }
+        } else if state == ConnectionState::ReceivedKeyExchange {
             if let Ok(length) = control_channel.read(&mut read_buffer) {
                 let reply_str = b"PUSH_REPLY";
                 if length >= reply_str.len() && read_buffer[..reply_str.len()] == reply_str[..] {
-                    got_push_reply = true;
                     println!("{}", str::from_utf8(&read_buffer[..length]).unwrap());
+                    if let Some(keys) = control_channel.derive_data_channel_keys() {
+                        data_channel = Some(DataChannel::new(
+                            [0, 0, 0],
+                            AES_256_GCM,
+                            keys.client_to_server,
+                            keys.server_to_client,
+                        ));
+                        state = ConnectionState::ReceivedOptions;
+                    }
                 }
             }
         }
-        let data_channel_keys = control_channel.derive_data_channel_keys().unwrap();
-        let mut data_channel = DataChannel::new(
-            [0, 0, 0],
-            AES_256_GCM,
-            data_channel_keys.client_to_server,
-            data_channel_keys.server_to_client,
-        );
-        loop {
-            let poll_result = poller.poll(-1, true).unwrap();
-            if poll_result.can_read_network {
-                let packet = receive_packet(&socket)?;
-                if let Packet::Data(p) = packet {
-                    let decrypted = data_channel.decrypt_packet(p).unwrap();
-                    tun.write(&decrypted)?;
+
+        // Try to send packets.
+        control_channel.send_packets();
+        let mut packets_sent = 0;
+        let mut send_queue = net_send_queue.borrow_mut();
+        for packet in send_queue.iter() {
+            let length = packet.to_buffer(&mut write_buffer)?;
+            let sent_bytes = match socket.send(&write_buffer[..length]) {
+                Ok(length) => length,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        break;
+                    } else {
+                        return Err(e)?;
+                    }
                 }
+            };
+
+            if sent_bytes < length {
+                // Incomplete packet.
+                break;
             }
+
+            packets_sent += 1;
+        }
+        if packets_sent == send_queue.len() {
+            send_queue.truncate(0);
+            poller.set_want_write_network(false);
+        } else {
+            let new_send_queue = send_queue[packets_sent..].to_vec();
+            *send_queue = new_send_queue;
         }
     }
-
-    socket_write_thread.join().unwrap()?;
-
-    Ok(())
 }
