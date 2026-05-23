@@ -93,3 +93,9 @@ impl Write for Tun {
         self.file.flush()
     }
 }
+
+impl AsRawFd for Tun {
+    fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
+        self.file.as_raw_fd()
+    }
+}

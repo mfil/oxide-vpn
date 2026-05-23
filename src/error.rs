@@ -9,6 +9,7 @@ pub enum Error {
     InvalidArgument(String),
     PermissionDenied(String),
     Handshake(String),
+    Retry(String),
     Io(io::Error),
     Ssl(openssl::error::ErrorStack),
     Unknown(String),
@@ -21,6 +22,7 @@ impl fmt::Display for Error {
             Error::InvalidArgument(s) => write!(formatter, "Invalid argument: {}", s),
             Error::PermissionDenied(s) => write!(formatter, "Permission denied: {}", s),
             Error::Handshake(s) => write!(formatter, "Handshake failed: {}", s),
+            Error::Retry(s) => write!(formatter, "Temporary error: {}", s),
             Error::Io(e) => write!(formatter, "IO Error: {}", e),
             Error::Ssl(e) => write!(formatter, "OpenSSL Error: {}", e),
             Error::Unknown(s) => write!(formatter, "Unknown error: {}", s),
@@ -39,6 +41,10 @@ impl Error {
 
     pub fn permission_error<S: Into<String>>(message: S) -> Self {
         Error::PermissionDenied(message.into())
+    }
+
+    pub fn retry<S: Into<String>>(message: S) -> Self {
+        Error::Retry(message.into())
     }
 }
 

@@ -102,7 +102,7 @@ fn main() -> Result<(), Error> {
         |packet| control_send.send(packet).unwrap(),
     );
 
-    let mut poller = poll::SocketPoller::new(&socket);
+    let mut poller = poll::SocketPoller::new(&socket, &tun);
 
     let socket_write = socket.try_clone()?;
     let socket_write_thread = thread::spawn(move || -> std::io::Result<()> {
@@ -126,8 +126,8 @@ fn main() -> Result<(), Error> {
     let mut read_buffer: [u8; 3000] = [0; 3000];
     control_channel.reset();
     while !control_channel.is_connected() {
-        poller.wait_for_data(-1, true).unwrap();
-        if poller.can_read_phys() {
+        let poll_result = poller.poll(-1, true).unwrap();
+        if poll_result.can_read_network {
             let packet = receive_packet(&socket)?;
             if let Packet::Control(p) = packet {
                 control_channel.receive_packet(p)?;
@@ -149,8 +149,8 @@ fn main() -> Result<(), Error> {
     let mut got_push_reply = false;
     while !SHUTDOWN.load(Ordering::Relaxed) {
         while !got_key_exchange {
-            poller.wait_for_data(-1, true).unwrap();
-            if poller.can_read_phys() {
+            let poll_result = poller.poll(-1, true).unwrap();
+            if poll_result.can_read_network {
                 let packet = receive_packet(&socket)?;
                 if let Packet::Control(p) = packet {
                     control_channel.receive_packet(p)?;
@@ -165,8 +165,8 @@ fn main() -> Result<(), Error> {
         control_channel.write(b"PUSH_REQUEST")?;
         control_channel.flush()?;
         while !got_push_reply {
-            poller.wait_for_data(0, true).unwrap();
-            if poller.can_read_phys() {
+            let poll_result = poller.poll(-1, true).unwrap();
+            if poll_result.can_read_network {
                 let packet = receive_packet(&socket)?;
                 if let Packet::Control(p) = packet {
                     control_channel.receive_packet(p)?;
@@ -190,8 +190,8 @@ fn main() -> Result<(), Error> {
             data_channel_keys.server_to_client,
         );
         loop {
-            poller.wait_for_data(-1, true).unwrap();
-            if poller.can_read_phys() {
+            let poll_result = poller.poll(-1, true).unwrap();
+            if poll_result.can_read_network {
                 let packet = receive_packet(&socket)?;
                 if let Packet::Data(p) = packet {
                     let decrypted = data_channel.decrypt_packet(p).unwrap();
