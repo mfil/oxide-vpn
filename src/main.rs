@@ -1,4 +1,5 @@
 extern crate bitflags;
+extern crate clap;
 extern crate libc;
 extern crate memsec;
 extern crate openssl;
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::thread;
 
+use clap::Parser;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 use rand::rng;
@@ -33,6 +35,35 @@ use packets::Packet;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+#[derive(Parser)]
+#[clap(name = "OxideVPN", version = "0.1.0", author = "Max Fillinger")]
+/// OpenVPN client implementation in Rust with obligatory rust pun.
+struct Args {
+    /// IP address of the OpenVPN server.
+    #[arg(short, long)]
+    remote: String,
+
+    /// Port of the OpenVPN server.
+    #[arg(short, long, default_value = "1194")]
+    port: u16,
+
+    /// Path to a CA certificate to validate the peer's certificate.
+    #[arg(long)]
+    ca: String,
+
+    /// Path to the client's certificate.
+    #[arg(long)]
+    cert: String,
+
+    /// Path to the client's private key.
+    #[arg(long)]
+    key: String,
+
+    /// Name of the tun interface to use.
+    #[arg(long, default_value = "")]
+    tun: String,
+}
+
 fn receive_packet(socket: &UdpSocket) -> Result<Packet, Error> {
     let mut read_buffer: [u8; 3000] = [0; 3000];
     let length = socket.recv(&mut read_buffer).unwrap();
@@ -40,35 +71,24 @@ fn receive_packet(socket: &UdpSocket) -> Result<Packet, Error> {
 }
 
 fn main() -> Result<(), Error> {
-    println!("Hello, world!");
-    let args = std::vec::Vec::from_iter(env::args());
-    if args.len() < 6 {
-        return Result::Err(Error::argument_error("Expected 6 command line arguments"));
-    }
+    let args = Args::parse();
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
-    let address = &args[1][..];
-    let port =
-        u16::from_str_radix(&args[2], 10).map_err(|_| Error::argument_error("bad port number"))?;
-    let ca_path = Path::new(&args[3]);
-    let cert_path = Path::new(&args[4]);
-    let key_path = Path::new(&args[5]);
 
-    let mut ca_file = File::open(ca_path)?;
+    let mut ca_file = File::open(args.ca)?;
     let mut ca_pem = Vec::new();
     let _ = ca_file.read_to_end(&mut ca_pem);
 
-    let mut cert_file = File::open(cert_path)?;
+    let mut cert_file = File::open(args.cert)?;
     let mut cert_pem = Vec::new();
     let _ = cert_file.read_to_end(&mut cert_pem);
 
-    let mut key_file = File::open(key_path)?;
+    let mut key_file = File::open(args.key)?;
     let mut key_pem = Vec::new();
     let _ = key_file.read_to_end(&mut key_pem);
 
-    let mut tun = tun::Tun::open(b"foo")?;
+    let mut tun = tun::Tun::open(args.tun.as_bytes())?;
 
-    socket.connect((address, port))?;
-    println!("Connected to {}:{}", &args[1][..], port);
+    socket.connect((args.remote, args.port))?;
 
     let (control_send, outgoing_receive) = channel();
 
