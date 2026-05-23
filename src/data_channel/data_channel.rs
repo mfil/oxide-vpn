@@ -15,7 +15,7 @@ impl PacketCounter {
     fn new(packets_per_epoch: u64) -> Self {
         Self {
             epoch: 1,
-            epoch_counter: 0,
+            epoch_counter: 1,
             packets_per_epoch,
         }
     }
@@ -28,10 +28,11 @@ impl PacketCounter {
     }
 
     fn increment(&mut self) {
-        self.epoch_counter += 1;
         if self.epoch_counter == self.packets_per_epoch {
             self.epoch += 1;
-            self.epoch_counter = 0;
+            self.epoch_counter = 1;
+        } else {
+            self.epoch_counter += 1;
         }
     }
 }
@@ -250,10 +251,10 @@ mod test {
     fn packet_counter_correctly_formats_packet_id() {
         let mut packet_counter = PacketCounter {
             epoch: 1,
-            epoch_counter: 0,
+            epoch_counter: 1,
             packets_per_epoch: 1 << 24,
         };
-        assert_eq!(packet_counter.get_packet_id(), [0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(packet_counter.get_packet_id(), [0, 1, 0, 0, 0, 0, 0, 1]);
 
         packet_counter.epoch = 23;
         packet_counter.epoch_counter = 1 << 23;
@@ -290,13 +291,13 @@ mod test {
     fn packet_counter_wraps_epoch() {
         let mut packet_counter = PacketCounter {
             epoch: 3,
-            epoch_counter: (1 << 24) - 1,
+            epoch_counter: 1 << 24,
             packets_per_epoch: 1 << 24,
         };
 
         packet_counter.increment();
         assert_eq!(packet_counter.epoch, 4);
-        assert_eq!(packet_counter.epoch_counter, 0);
+        assert_eq!(packet_counter.epoch_counter, 1);
     }
 
     #[test]
@@ -327,7 +328,7 @@ mod test {
         epoch_key_decrypt_copy.advance_epoch().unwrap();
         let test_packet = make_test_packet(
             &epoch_key_decrypt_copy,
-            0x0004000000000000,
+            0x0004000000000001,
             b"Tut das Not dass das hier so rumoxidiert?",
         );
 
@@ -347,13 +348,13 @@ mod test {
         let mut epoch_key_decrypt_copy = EpochKey::from_key_material(&[0; 32]);
         epoch_key_decrypt_copy.advance_epoch().unwrap();
         let test_packet_epoch_2 =
-            make_test_packet(&epoch_key_decrypt_copy, 0x0002000000000000, b"Epoch 2");
+            make_test_packet(&epoch_key_decrypt_copy, 0x0002000000000001, b"Epoch 2");
 
         epoch_key_decrypt_copy.advance_epoch().unwrap();
         epoch_key_decrypt_copy.advance_epoch().unwrap();
         epoch_key_decrypt_copy.advance_epoch().unwrap();
         let test_packet_epoch_5 =
-            make_test_packet(&epoch_key_decrypt_copy, 0x0005000000000000, b"Epoch 5");
+            make_test_packet(&epoch_key_decrypt_copy, 0x0005000000000001, b"Epoch 5");
 
         let mut data_channel =
             DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
@@ -370,7 +371,7 @@ mod test {
         let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
         let test_packet = make_test_packet(
             &epoch_key_decrypt,
-            0x0001000000000000,
+            0x0001000000000001,
             b"Tut das Not dass das hier so rumoxidiert?",
         );
 
@@ -393,7 +394,7 @@ mod test {
         let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
         let test_packet = make_test_packet(
             &epoch_key_decrypt,
-            0x0001000000000000,
+            0x0001000000000001,
             b"Tut das Not dass das hier so rumoxidiert?",
         );
 
@@ -414,7 +415,7 @@ mod test {
         let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
         let test_packet = make_test_packet(
             &epoch_key_decrypt,
-            0x0001000000000000,
+            0x0001000000000001,
             b"Tut das Not dass das hier so rumoxidiert?",
         );
 
@@ -446,7 +447,7 @@ mod test {
         assert_eq!(packet.opcode, Opcode::DataV2);
         assert_eq!(packet.key_id, 0);
         assert_eq!(packet.get_epoch(), 1);
-        assert_eq!(packet.get_packet_id(), &[0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(packet.get_packet_id(), &[0, 1, 0, 0, 0, 0, 0, 1]);
         assert_eq!(
             decrypt_payload(&packet, &encryption_key, &iv).unwrap(),
             b"Tut das Not dass das hier so rumoxidiert?"
@@ -461,7 +462,7 @@ mod test {
 
         let mut data_channel =
             DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
-        data_channel.next_packet_id.epoch_counter = (1 << 24) - 1;
+        data_channel.next_packet_id.epoch_counter = 1 << 24;
 
         let encryption_key = epoch_key_encrypt_copy.derive_encryption_key().unwrap();
         let iv = epoch_key_encrypt_copy.derive_implicit_iv().unwrap();
@@ -469,7 +470,7 @@ mod test {
         assert_eq!(packet.opcode, Opcode::DataV2);
         assert_eq!(packet.key_id, 0);
         assert_eq!(packet.get_epoch(), 1);
-        assert_eq!(packet.get_packet_id(), &[0, 1, 0, 0, 0, 255, 255, 255]);
+        assert_eq!(packet.get_packet_id(), &[0, 1, 0, 0, 1, 0, 0, 0]);
         assert_eq!(
             decrypt_payload(&packet, &encryption_key, &iv).unwrap(),
             b"Der geht ja noch!"
@@ -484,7 +485,7 @@ mod test {
         assert_eq!(packet.opcode, Opcode::DataV2);
         assert_eq!(packet.key_id, 0);
         assert_eq!(packet.get_epoch(), 2);
-        assert_eq!(packet.get_packet_id(), &[0, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(packet.get_packet_id(), &[0, 2, 0, 0, 0, 0, 0, 1]);
         assert_eq!(
             decrypt_payload(&packet, &encryption_key, &iv).unwrap(),
             b"Tut das Not dass das hier so rumoxidiert?"
