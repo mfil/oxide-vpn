@@ -184,14 +184,37 @@ impl DataChannelPacket {
     pub fn get_payload(&self) -> &[u8] {
         &self.packet_data[Self::PAYLOAD_OFFSET..(self.packet_data.len() - 16)]
     }
+    pub fn get_payload_mut(&mut self) -> &mut [u8] {
+        let payload_end = self.packet_data.len() - 16;
+        &mut self.packet_data[Self::PAYLOAD_OFFSET..payload_end]
+    }
 
     pub fn get_auth_tag(&self) -> &[u8; 16] {
         self.packet_data.last_chunk::<16>().unwrap()
+    }
+    pub fn get_auth_tag_mut(&mut self) -> &mut [u8; 16] {
+        self.packet_data.last_chunk_mut::<16>().unwrap()
     }
 
     /// Get the unencrypted but authenticated portion of the packet. That is, the "AD" in "AEAD".
     pub fn get_additional_authenticated_data(&self) -> &[u8; 12] {
         &self.packet_data.first_chunk::<12>().unwrap()
+    }
+
+    pub fn from_packet_data(packet_data: Vec<u8>) -> Result<Self, Error> {
+        if packet_data.len() < 28 {
+            return Err(Error::packet_error("Data channel packet too short."));
+        }
+
+        let first_byte = packet_data[0];
+        let opcode = Opcode::try_from(first_byte >> 3)?;
+        let key_id = first_byte & 0x07;
+
+        Ok(DataChannelPacket {
+            opcode,
+            key_id,
+            packet_data,
+        })
     }
 }
 

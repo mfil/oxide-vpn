@@ -2,7 +2,8 @@ use openssl::cipher::Cipher;
 use openssl::cipher_ctx::CipherCtx;
 
 use super::keys::{EncryptionKey, EpochKey, ImplicitIv};
-use crate::packets::DataChannelPacket;
+use crate::Error;
+use crate::packets::{DataChannelPacket, Opcode};
 
 struct PacketCounter {
     pub epoch: u16,
@@ -21,17 +22,16 @@ impl PacketCounter {
 
     fn get_packet_id(&self) -> [u8; 8] {
         let mut packet_id = self.epoch_counter.to_be_bytes();
-        packet_id[0] = (self.epoch_counter >> 8) as u8;
-        packet_id[1] = self.epoch_counter as u8;
+        packet_id[0] = (self.epoch >> 8) as u8;
+        packet_id[1] = self.epoch as u8;
         packet_id
     }
 
     fn increment(&mut self) {
+        self.epoch_counter += 1;
         if self.epoch_counter == self.packets_per_epoch {
             self.epoch += 1;
             self.epoch_counter = 0;
-        } else {
-            self.epoch_counter += 1;
         }
     }
 }
@@ -91,6 +91,43 @@ impl DataChannel {
         }
     }
 
+    /// Encrypt the payload and create a data channel packet.
+    pub fn encrypt_packet(&mut self, payload: &[u8]) -> Result<DataChannelPacket, Error> {
+        if self.encryption_key.epoch < self.next_packet_id.epoch {
+            while self.encryption_epoch_key.epoch < self.next_packet_id.epoch {
+                self.encryption_epoch_key.advance_epoch()?;
+            }
+            self.encryption_key = self.encryption_epoch_key.derive_encryption_key()?;
+            self.encryption_iv = self.encryption_epoch_key.derive_implicit_iv()?;
+        }
+        let packet_id = self.next_packet_id.get_packet_id();
+        self.next_packet_id.increment();
+
+        let mut packet_data = Vec::with_capacity(12 + payload.len() + 16);
+        packet_data.push((Opcode::DataV2 as u8) << 3);
+        packet_data.extend_from_slice(self.peer_id.as_slice());
+        packet_data.extend_from_slice(packet_id.as_slice());
+        packet_data.extend_from_slice(payload);
+        packet_data.extend_from_slice([0; 16].as_slice());
+
+        let mut packet = DataChannelPacket::from_packet_data(packet_data)?;
+
+        let iv = combine_iv(&packet_id, &self.encryption_iv);
+        let mut cipher_ctx = CipherCtx::new()?;
+        cipher_ctx.encrypt_init(
+            Some(Cipher::aes_256_gcm()),
+            Some(&self.encryption_key.key_bytes),
+            Some(&iv),
+        )?;
+        cipher_ctx.cipher_update(packet.get_additional_authenticated_data(), None)?;
+        cipher_ctx.cipher_update_inplace(packet.get_payload_mut(), payload.len())?;
+        cipher_ctx.cipher_final(&mut [])?;
+        cipher_ctx.tag(packet.get_auth_tag_mut())?;
+
+        Ok(packet)
+    }
+
+    /// Process an incoming data channel packet and return the decrypted payload.
     pub fn decrypt_packet(&mut self, packet: DataChannelPacket) -> Option<Vec<u8>> {
         let mut cipher_ctx = CipherCtx::new().unwrap();
         let packet_epoch = packet.get_epoch();
@@ -142,7 +179,9 @@ mod test {
     use openssl::cipher::Cipher;
     use openssl::cipher_ctx::CipherCtx;
 
-    use crate::data_channel::keys::EpochKey;
+    use crate::Error;
+    use crate::data_channel::data_channel::PacketCounter;
+    use crate::data_channel::keys::{EncryptionKey, EpochKey, ImplicitIv};
     use crate::packets::{DataChannelPacket, Opcode};
 
     use super::{AES_256_GCM, DataChannel, combine_iv};
@@ -187,6 +226,77 @@ mod test {
             key_id: 0,
             packet_data: packet,
         }
+    }
+
+    fn decrypt_payload(
+        packet: &DataChannelPacket,
+        key: &EncryptionKey,
+        iv: &ImplicitIv,
+    ) -> Result<Vec<u8>, Error> {
+        let mut cipher_ctx = CipherCtx::new().unwrap();
+        let iv = combine_iv(packet.get_packet_id(), iv);
+        let mut payload = packet.get_payload().to_vec();
+        cipher_ctx.decrypt_init(Some(Cipher::aes_256_gcm()), Some(&key.key_bytes), Some(&iv))?;
+        cipher_ctx.set_tag(packet.get_auth_tag())?;
+        cipher_ctx.cipher_update(packet.get_additional_authenticated_data(), None)?;
+        let length = payload.len();
+        cipher_ctx.cipher_update_inplace(&mut payload, length)?;
+        cipher_ctx.cipher_final(&mut [])?;
+
+        Ok(payload)
+    }
+
+    #[test]
+    fn packet_counter_correctly_formats_packet_id() {
+        let mut packet_counter = PacketCounter {
+            epoch: 1,
+            epoch_counter: 0,
+            packets_per_epoch: 1 << 24,
+        };
+        assert_eq!(packet_counter.get_packet_id(), [0, 1, 0, 0, 0, 0, 0, 0]);
+
+        packet_counter.epoch = 23;
+        packet_counter.epoch_counter = 1 << 23;
+        assert_eq!(
+            packet_counter.get_packet_id(),
+            [0, 23, 0, 0, 0, 1 << 7, 0, 0]
+        );
+
+        packet_counter.epoch = (1 << 14) + 1;
+        packet_counter.epoch_counter = 1 << 23;
+        assert_eq!(
+            packet_counter.get_packet_id(),
+            [1 << 6, 1, 0, 0, 0, 1 << 7, 0, 0]
+        );
+    }
+
+    #[test]
+    fn packet_counter_correctly_increments() {
+        let mut packet_counter = PacketCounter {
+            epoch: 1,
+            epoch_counter: 0,
+            packets_per_epoch: 1 << 24,
+        };
+
+        packet_counter.increment();
+        assert_eq!(packet_counter.epoch_counter, 1);
+        packet_counter.increment();
+        assert_eq!(packet_counter.epoch_counter, 2);
+        packet_counter.increment();
+        assert_eq!(packet_counter.epoch_counter, 3);
+    }
+
+    #[test]
+    fn packet_counter_wraps_epoch() {
+        let mut packet_counter = PacketCounter {
+            epoch: 3,
+            epoch_counter: (1 << 24) - 1,
+            packets_per_epoch: 1 << 24,
+        };
+
+        packet_counter.increment();
+        assert_eq!(packet_counter.epoch, 4);
+        assert_eq!(packet_counter.epoch_counter, 0);
     }
 
     #[test]
@@ -319,5 +429,93 @@ mod test {
             packet.packet_data[index] ^= 1;
             assert!(data_channel.decrypt_packet(packet).is_none());
         }
+    }
+
+    #[test]
+    fn encrypt_first_epoch_packet() {
+        let epoch_key_encrypt = EpochKey::from_key_material(&[23; 32]);
+        let encryption_key = epoch_key_encrypt.derive_encryption_key().unwrap();
+        let iv = epoch_key_encrypt.derive_implicit_iv().unwrap();
+        let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
+        let mut data_channel =
+            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+        let packet = data_channel
+            .encrypt_packet(b"Tut das Not dass das hier so rumoxidiert?")
+            .unwrap();
+
+        assert_eq!(packet.opcode, Opcode::DataV2);
+        assert_eq!(packet.key_id, 0);
+        assert_eq!(packet.get_epoch(), 1);
+        assert_eq!(packet.get_packet_id(), &[0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            decrypt_payload(&packet, &encryption_key, &iv).unwrap(),
+            b"Tut das Not dass das hier so rumoxidiert?"
+        );
+    }
+
+    #[test]
+    fn encrypt_packet_advances_epoch() {
+        let epoch_key_encrypt = EpochKey::from_key_material(&[23; 32]);
+        let mut epoch_key_encrypt_copy = EpochKey::from_key_material(&[23; 32]);
+        let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
+
+        let mut data_channel =
+            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+        data_channel.next_packet_id.epoch_counter = (1 << 24) - 1;
+
+        let encryption_key = epoch_key_encrypt_copy.derive_encryption_key().unwrap();
+        let iv = epoch_key_encrypt_copy.derive_implicit_iv().unwrap();
+        let packet = data_channel.encrypt_packet(b"Der geht ja noch!").unwrap();
+        assert_eq!(packet.opcode, Opcode::DataV2);
+        assert_eq!(packet.key_id, 0);
+        assert_eq!(packet.get_epoch(), 1);
+        assert_eq!(packet.get_packet_id(), &[0, 1, 0, 0, 0, 255, 255, 255]);
+        assert_eq!(
+            decrypt_payload(&packet, &encryption_key, &iv).unwrap(),
+            b"Der geht ja noch!"
+        );
+
+        epoch_key_encrypt_copy.advance_epoch().unwrap();
+        let encryption_key = epoch_key_encrypt_copy.derive_encryption_key().unwrap();
+        let iv = epoch_key_encrypt_copy.derive_implicit_iv().unwrap();
+        let packet = data_channel
+            .encrypt_packet(b"Tut das Not dass das hier so rumoxidiert?")
+            .unwrap();
+        assert_eq!(packet.opcode, Opcode::DataV2);
+        assert_eq!(packet.key_id, 0);
+        assert_eq!(packet.get_epoch(), 2);
+        assert_eq!(packet.get_packet_id(), &[0, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            decrypt_payload(&packet, &encryption_key, &iv).unwrap(),
+            b"Tut das Not dass das hier so rumoxidiert?"
+        );
+    }
+
+    #[test]
+    fn data_channels_can_talk_to_each_other() {
+        let epoch_key_encrypt = EpochKey::from_key_material(&[23; 32]);
+        let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
+        let epoch_key_encrypt_copy = EpochKey::from_key_material(&[23; 32]);
+        let epoch_key_decrypt_copy = EpochKey::from_key_material(&[0; 32]);
+        let mut data_channel =
+            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+        let mut data_channel_peer = DataChannel::new(
+            [0, 0, 0],
+            AES_256_GCM,
+            epoch_key_decrypt_copy,
+            epoch_key_encrypt_copy,
+        );
+
+        let packet_to_peer = data_channel
+            .encrypt_packet(b"Tut das Not dass das hier so rumoxidiert?")
+            .unwrap();
+        let payload = data_channel_peer.decrypt_packet(packet_to_peer).unwrap();
+        assert_eq!(payload, b"Tut das Not dass das hier so rumoxidiert?");
+
+        let packet_from_peer = data_channel_peer
+            .encrypt_packet(b"Tut das Not dass das hier so rumoxidiert?")
+            .unwrap();
+        let payload = data_channel.decrypt_packet(packet_from_peer).unwrap();
+        assert_eq!(payload, b"Tut das Not dass das hier so rumoxidiert?");
     }
 }
