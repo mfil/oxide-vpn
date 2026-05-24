@@ -7,12 +7,9 @@ extern crate rand;
 
 use std::cell::RefCell;
 use std::fs::File;
+use std::io;
 use std::io::{Read, Write};
 use std::net::UdpSocket;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::{env, io};
 
 use clap::Parser;
 use openssl::pkey::PKey;

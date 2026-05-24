@@ -1,4 +1,4 @@
-use libc::{__errno_location, EAGAIN, EINTR, POLLIN, POLLOUT, c_int, poll, pollfd};
+use libc::{__errno_location, EAGAIN, EINTR, POLLIN, POLLOUT, poll, pollfd};
 use std::{net::UdpSocket, os::fd::AsRawFd};
 
 use crate::Error;

@@ -1,6 +1,6 @@
 use std::cmp::min;
 
-use crate::packets::{ControlChannelPacket, Opcode, Packet};
+use crate::packets::{ControlChannelPacket, Opcode};
 
 /// Tracks packet IDs that we saw from the peer.
 #[derive(Debug)]
