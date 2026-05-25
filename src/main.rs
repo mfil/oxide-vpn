@@ -28,6 +28,7 @@ use data_channel::{AES_256_GCM, DataChannel};
 use error::Error;
 use packets::Packet;
 
+use crate::control_channel::messages::PushReply;
 use crate::packets::PacketBuffer;
 
 #[derive(Parser)]
@@ -171,10 +172,15 @@ fn main() -> Result<(), Error> {
             if let Ok(length) = control_channel.read(&mut read_buffer) {
                 let reply_str = b"PUSH_REPLY";
                 if length >= reply_str.len() && read_buffer[..reply_str.len()] == reply_str[..] {
-                    println!("{}", str::from_utf8(&read_buffer[..length]).unwrap());
+                    let push_reply =
+                        PushReply::parse(str::from_utf8(&read_buffer[..length - 1]).unwrap())?;
+                    if !push_reply.protocol_flags.aead_epoch {
+                        println!("Peer does not support aead-epoch.");
+                        break;
+                    }
                     if let Some(keys) = control_channel.derive_data_channel_keys() {
                         data_channel = Some(DataChannel::new(
-                            [0, 0, 0],
+                            push_reply.peer_id,
                             AES_256_GCM,
                             keys.client_to_server,
                             keys.server_to_client,
@@ -188,4 +194,5 @@ fn main() -> Result<(), Error> {
         // Try to send packets.
         control_channel.send_packets();
     }
+    Ok(())
 }

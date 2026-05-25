@@ -1,8 +1,9 @@
 //! Messages to send through the TLS session established via the control channel.
-
 use bitflags::bitflags;
 use rand::CryptoRng;
 use std::fmt::Write;
+
+use crate::Error;
 
 bitflags! {
     pub struct IvProto: u16 {
@@ -74,5 +75,61 @@ impl<'a> PeerInfo<'a> {
         )
         .unwrap();
         out
+    }
+}
+
+#[derive(Debug)]
+pub struct ProtocolFlags {
+    pub aead_epoch: bool,
+}
+
+/// PUSH_REPLY message from an OpenVPN server.
+#[derive(Debug)]
+pub struct PushReply {
+    pub peer_id: u32,
+    pub protocol_flags: ProtocolFlags,
+}
+
+impl PushReply {
+    pub fn parse(message: &str) -> Result<Self, Error> {
+        let mut message_parts = message.split(|c| c == ',');
+        let mut peer_id: Option<u32> = None;
+        let mut protocol_flags = ProtocolFlags { aead_epoch: false };
+
+        let first_part = message_parts.next();
+        if first_part != Some("PUSH_REPLY") {
+            return Err(Error::packet_error("Not a PUSH_REPLY message"));
+        }
+        for part in message_parts {
+            let mut split = part.splitn(2, |c| c == ' ');
+            let key = split.next();
+            let value = split.next();
+
+            if key == Some("peer-id") {
+                if let Some(v) = value
+                    && let Ok(n) = u32::from_str_radix(v, 10)
+                    && n < 1 << 24
+                {
+                    peer_id = Some(n);
+                } else {
+                    return Err(Error::packet_error("Invalid peer-id."));
+                }
+            } else if key == Some("protocol-flags") {
+                if let Some(v) = value {
+                    if v == "aead-epoch" {
+                        protocol_flags.aead_epoch = true;
+                    }
+                }
+            }
+        }
+
+        if let Some(peer_id) = peer_id {
+            Ok(PushReply {
+                peer_id,
+                protocol_flags,
+            })
+        } else {
+            Err(Error::packet_error("PUSH_REPLY missing peer-id."))
+        }
     }
 }

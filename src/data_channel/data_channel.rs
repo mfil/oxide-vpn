@@ -49,7 +49,7 @@ pub const AES_256_GCM: Algorithm = Algorithm {
 };
 
 pub struct DataChannel {
-    peer_id: [u8; 3],
+    peer_id: u32,
     algorithm: Algorithm,
     encryption_epoch_key: EpochKey,
     encryption_key: EncryptionKey,
@@ -72,7 +72,7 @@ fn combine_iv(packet_id: &[u8; 8], implicit_iv: &ImplicitIv) -> [u8; 12] {
 
 impl DataChannel {
     pub fn new(
-        peer_id: [u8; 3],
+        peer_id: u32,
         algorithm: Algorithm,
         encryption_epoch_key: EpochKey,
         decryption_epoch_key: EpochKey,
@@ -315,7 +315,7 @@ mod test {
             b"Tut das Not dass das hier so rumoxidiert?",
         );
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
         assert_eq!(
             data_channel.decrypt_packet(test_packet).unwrap(),
             b"Tut das Not dass das hier so rumoxidiert?"
@@ -340,7 +340,7 @@ mod test {
         );
 
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
         assert_eq!(
             data_channel.decrypt_packet(test_packet).unwrap(),
             b"Tut das Not dass das hier so rumoxidiert?"
@@ -374,7 +374,7 @@ mod test {
         );
 
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
         assert_eq!(
             data_channel.decrypt_packet(test_packet_epoch_5).unwrap(),
             b"Epoch 5",
@@ -395,7 +395,7 @@ mod test {
         );
 
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
 
         // Check that manipulating any byte in the authentication tag causes decryption to fail.
         let raw_packet = test_packet.to_vec();
@@ -422,7 +422,7 @@ mod test {
         );
 
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
 
         // Check that manipulating any byte before the payload causes decryption to fail.
         let raw_packet = test_packet.to_vec();
@@ -447,7 +447,7 @@ mod test {
         );
 
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
 
         // Check that manipulating any byte in the payload causes decryption to fail.
         let raw_packet = test_packet.to_vec();
@@ -473,7 +473,7 @@ mod test {
         let iv = epoch_key_encrypt.derive_implicit_iv().unwrap();
         let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
         data_channel.encrypt_packet(&mut packet_buffer).unwrap();
 
         let expected_header = get_expected_header(0, [0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 1]);
@@ -494,7 +494,7 @@ mod test {
         let epoch_key_decrypt = EpochKey::from_key_material(&[0; 32]);
 
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
         data_channel.next_packet_id.epoch_counter = 1 << 24;
 
         let encryption_key = epoch_key_encrypt_copy.derive_encryption_key().unwrap();
@@ -533,9 +533,9 @@ mod test {
         let epoch_key_encrypt_copy = EpochKey::from_key_material(&[23; 32]);
         let epoch_key_decrypt_copy = EpochKey::from_key_material(&[0; 32]);
         let mut data_channel =
-            DataChannel::new([0, 0, 0], AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
+            DataChannel::new(0, AES_256_GCM, epoch_key_encrypt, epoch_key_decrypt);
         let mut data_channel_peer = DataChannel::new(
-            [0, 0, 0],
+            0,
             AES_256_GCM,
             epoch_key_decrypt_copy,
             epoch_key_encrypt_copy,

@@ -393,11 +393,11 @@ impl<'a> DataChannelPacketBuffer<'a> {
         &mut self.buffer[start..]
     }
 
-    pub fn write_header(&mut self, key_id: u8, peer_id: [u8; 3], packet_id: [u8; 8]) {
+    pub fn write_header(&mut self, key_id: u8, peer_id: u32, packet_id: [u8; 8]) {
         let first_byte = (Opcode::DataV2 as u8) << 3 | key_id;
         self.buffer[0] = first_byte;
         let (peer_id_bytes, rest) = self.buffer[1..].split_first_chunk_mut::<3>().unwrap();
-        *peer_id_bytes = peer_id;
+        peer_id_bytes.copy_from_slice(&peer_id.to_be_bytes()[1..]);
         let (packet_counter_bytes, _) = rest.split_first_chunk_mut::<8>().unwrap();
         *packet_counter_bytes = packet_id;
     }
