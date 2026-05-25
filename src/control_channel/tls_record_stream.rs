@@ -3,6 +3,8 @@ use std::io;
 use std::io::{Read, Write};
 use std::mem::swap;
 
+use crate::packets::ControlChannelPacketBuffer;
+
 /// Assuming that record points at a TLS record header, calculate the length, including the header.
 fn get_tls_record_length(record: &[u8]) -> usize {
     let (header, _) = record.split_first_chunk::<5>().unwrap();
@@ -21,8 +23,8 @@ pub struct TlsRecordStream {
     /// The payloads of the received packets, in one continuous stream.
     payloads_to_read: Vec<u8>,
     /// Data to send to the peer.
-    written_tls_records: Vec<Vec<u8>>,
-    partial_record: Vec<u8>,
+    written_tls_records: Vec<ControlChannelPacketBuffer>,
+    partial_record: Option<ControlChannelPacketBuffer>,
 }
 
 impl TlsRecordStream {
@@ -30,22 +32,18 @@ impl TlsRecordStream {
         Self {
             payloads_to_read: Vec::new(),
             written_tls_records: Vec::new(),
-            partial_record: Vec::new(),
+            partial_record: None,
         }
     }
 
-    pub fn get_written_records(&mut self) -> Vec<Vec<u8>> {
+    pub fn get_written_records(&mut self) -> Vec<ControlChannelPacketBuffer> {
         let mut out = Vec::new();
         swap(&mut out, &mut self.written_tls_records);
         out
     }
 
-    pub fn insert_payload(&mut self, payload: Vec<u8>) {
-        if self.payloads_to_read.is_empty() {
-            self.payloads_to_read = payload;
-        } else {
-            self.payloads_to_read.extend_from_slice(&payload);
-        }
+    pub fn insert_payload(&mut self, payload: &[u8]) {
+        self.payloads_to_read.extend(payload);
     }
 }
 
@@ -69,34 +67,35 @@ impl Write for TlsRecordStream {
         let mut record: &[u8];
         let mut rest = buffer;
 
-        if !self.partial_record.is_empty() {
+        if let Some(mut partial_record) = self.partial_record.take() {
             let missing_bytes =
-                get_tls_record_length(&self.partial_record) - self.partial_record.len();
+                get_tls_record_length(partial_record.get_payload()) - partial_record.payload_len();
             if buffer.len() < missing_bytes {
-                self.partial_record.extend_from_slice(buffer);
+                partial_record.extend_payload_from_slice(buffer);
+                self.partial_record = Some(partial_record);
                 return Ok(buffer.len());
             }
 
             let record_tail: &[u8];
             (record_tail, rest) = rest.split_at(missing_bytes);
-            let mut new_record = Vec::with_capacity(self.partial_record.len() + missing_bytes);
-            new_record.extend_from_slice(&self.partial_record);
-            new_record.extend_from_slice(record_tail);
-            self.written_tls_records.push(new_record);
-            self.partial_record.clear();
+            partial_record.extend_payload_from_slice(record_tail);
+            self.written_tls_records.push(partial_record);
         }
 
         // We keep going until there are less than five bytes left. A TLS record header is five
         // bytes, so we can't do anything with less.
         while rest.len() >= 5 {
             let record_len = get_tls_record_length(rest);
+            let mut next_record = ControlChannelPacketBuffer::with_payload_capacity(record_len);
             if record_len > rest.len() {
-                self.partial_record.extend_from_slice(rest);
+                next_record.extend_payload_from_slice(rest);
+                self.partial_record = Some(next_record);
                 return Ok(buffer.len());
             }
 
             (record, rest) = rest.split_at(record_len);
-            self.written_tls_records.push(record.to_vec());
+            next_record.extend_payload_from_slice(record);
+            self.written_tls_records.push(next_record);
         }
         Ok(buffer.len() - rest.len())
     }
@@ -126,7 +125,7 @@ mod test {
         let actual = record_stream.get_written_records();
         assert_eq!(actual.len(), expected.len());
         for (record, expected_record) in actual.iter().zip(expected.iter()) {
-            assert_eq!(record, *expected_record);
+            assert_eq!(record.get_payload(), *expected_record);
         }
     }
 
@@ -195,7 +194,7 @@ mod test {
     fn tls_record_stream_can_read() {
         let mut record_stream = TlsRecordStream::new();
         let mut read_buffer = [0; 5];
-        record_stream.insert_payload(RECORD1.to_vec());
+        record_stream.insert_payload(RECORD1);
         assert_eq!(record_stream.read(&mut read_buffer).unwrap(), 5);
         assert_eq!(read_buffer, RECORD1[..5]);
         assert_eq!(record_stream.read(&mut read_buffer).unwrap(), 5);

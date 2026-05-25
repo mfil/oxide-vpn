@@ -5,9 +5,7 @@ extern crate memsec;
 extern crate openssl;
 extern crate rand;
 
-use std::cell::RefCell;
 use std::fs::File;
-use std::io;
 use std::io::{Read, Write};
 use std::net::UdpSocket;
 
@@ -29,6 +27,8 @@ use control_channel::messages::{IvProto, PeerInfo};
 use data_channel::{AES_256_GCM, DataChannel};
 use error::Error;
 use packets::Packet;
+
+use crate::packets::PacketBuffer;
 
 #[derive(Parser)]
 #[clap(name = "OxideVPN", version = "0.1.0", author = "Max Fillinger")]
@@ -63,12 +63,6 @@ struct Args {
     tun: String,
 }
 
-fn receive_packet(socket: &UdpSocket) -> Result<Packet, Error> {
-    let mut read_buffer: [u8; 3000] = [0; 3000];
-    let length = socket.recv(&mut read_buffer).unwrap();
-    Packet::parse(&read_buffer[..length])
-}
-
 #[derive(PartialEq, Eq)]
 enum ConnectionState {
     Uninitialized,
@@ -97,7 +91,6 @@ fn main() -> Result<(), Error> {
 
     socket.connect((args.remote, args.port))?;
 
-    let net_send_queue = RefCell::new(Vec::<Packet>::new());
     let mut control_channel = ControlChannel::new(
         &mut rng(),
         false,
@@ -105,33 +98,33 @@ fn main() -> Result<(), Error> {
         X509::from_pem(&cert_pem)?,
         PKey::private_key_from_pem(&key_pem)?,
         args.peer_name,
-        |packet| net_send_queue.borrow_mut().push(Packet::Control(packet)),
+        |packet| {
+            socket.send(packet.as_slice()).unwrap();
+        },
     );
     let mut data_channel: Option<DataChannel> = None;
 
     let mut poller = poll::SocketPoller::new(&socket, &tun);
     let mut state = ConnectionState::Uninitialized;
 
-    let mut read_buffer: [u8; 3000] = [0; 3000];
-    let mut write_buffer: [u8; 3000] = [0; 3000];
+    let mut packet_buffer = PacketBuffer::new(3000);
+    let mut read_buffer = [0u8; 3000];
+    let mut write_buffer = [0u8; 3000];
 
     control_channel.reset();
     control_channel.send_packets();
-    let packet = net_send_queue.borrow_mut().pop().unwrap();
-    let length = packet.to_buffer(&mut write_buffer)?;
-    socket.send(&write_buffer[..length])?;
     socket.set_nonblocking(true)?;
 
     loop {
         let poll_result = poller.poll(-1, true)?;
 
         if poll_result.can_read_network {
-            let packet = receive_packet(&socket)?;
+            let packet = packet_buffer.recv_packet(&socket)?;
             match packet {
                 Packet::Control(p) => control_channel.receive_packet(p)?,
                 Packet::Data(p) => {
                     if let Some(data_channel) = &mut data_channel {
-                        let decrypted_packet = data_channel.decrypt_packet(p).unwrap();
+                        let decrypted_packet = data_channel.decrypt_packet(p)?;
                         tun.write(&decrypted_packet)?;
                     } else {
                         println!("Received data channel packet before it is ready, ignoring.");
@@ -142,11 +135,9 @@ fn main() -> Result<(), Error> {
 
         if poll_result.can_read_tun {
             if let Some(data_channel) = &mut data_channel {
-                let length = tun.read(&mut read_buffer)?;
-                let encrypted_packet = data_channel.encrypt_packet(&read_buffer[..length])?;
-                net_send_queue
-                    .borrow_mut()
-                    .push(Packet::Data(encrypted_packet));
+                let mut data_packet_buffer = packet_buffer.read_data_channel_plaintext(&mut tun)?;
+                data_channel.encrypt_packet(&mut data_packet_buffer)?;
+                socket.send(data_packet_buffer.as_slice())?;
             } else {
                 println!(
                     "tun interface received packets before the data channel is ready, ignoring."
@@ -196,34 +187,5 @@ fn main() -> Result<(), Error> {
 
         // Try to send packets.
         control_channel.send_packets();
-        let mut packets_sent = 0;
-        let mut send_queue = net_send_queue.borrow_mut();
-        for packet in send_queue.iter() {
-            let length = packet.to_buffer(&mut write_buffer)?;
-            let sent_bytes = match socket.send(&write_buffer[..length]) {
-                Ok(length) => length,
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        break;
-                    } else {
-                        return Err(e)?;
-                    }
-                }
-            };
-
-            if sent_bytes < length {
-                // Incomplete packet.
-                break;
-            }
-
-            packets_sent += 1;
-        }
-        if packets_sent == send_queue.len() {
-            send_queue.truncate(0);
-            poller.set_want_write_network(false);
-        } else {
-            let new_send_queue = send_queue[packets_sent..].to_vec();
-            *send_queue = new_send_queue;
-        }
     }
 }

@@ -1,6 +1,6 @@
 use std::cmp::min;
 
-use crate::packets::{ControlChannelPacket, Opcode};
+use crate::packets::{ControlChannelPacket, ControlChannelPacketBuffer, Opcode};
 
 /// Tracks packet IDs that we saw from the peer.
 #[derive(Debug)]
@@ -75,57 +75,34 @@ impl ControlChannelState {
         self.peer_packet_ids.unacked_ids.len()
     }
 
-    /// Make a control channel packet with the given opcode and payload.
-    ///
-    /// This increments the `next_packet_id` and marks some of the peer packet IDs as acked.
-    pub fn make_packet(&mut self, opcode: Opcode, payload: Vec<u8>) -> ControlChannelPacket {
+    /// Fill out the header for a control channel packet.
+    pub fn fill_header(&mut self, opcode: Opcode, buffer: &mut ControlChannelPacketBuffer) {
+        let packet_id: Option<u32>;
+        let num_acks: usize;
         if opcode == Opcode::ControlAckV1 {
-            self.make_ack_packet();
+            packet_id = None;
+            num_acks = 8;
+        } else {
+            packet_id = Some(self.next_packet_id);
+            self.next_packet_id += 1;
+            num_acks = 4;
         }
 
-        let packet_id = Some(self.next_packet_id);
-        self.next_packet_id += 1;
-
-        let acks = self.peer_packet_ids.ack(4).to_vec();
+        let acks = self.peer_packet_ids.ack(num_acks);
         let peer_session_id = if acks.len() > 0 {
             self.peer_session_id
         } else {
             None
         };
 
-        ControlChannelPacket {
+        buffer.write_header(
             opcode,
-            key_id: self.key_id,
-            session_id: self.session_id,
+            self.key_id,
+            self.session_id,
             acks,
             peer_session_id,
             packet_id,
-            payload,
-        }
-    }
-
-    /// Make an ACK packet.
-    ///
-    /// These are special control channel packets that only serve to ack received packets. They can
-    /// be sent if we are not sending enough regular packets to ack all the packets we get from our
-    /// peer. They don't have a payload or message ID.
-    pub fn make_ack_packet(&mut self) -> ControlChannelPacket {
-        let acks = self.peer_packet_ids.ack(8).to_vec();
-        let peer_session_id = if acks.len() > 0 {
-            self.peer_session_id
-        } else {
-            None
-        };
-
-        ControlChannelPacket {
-            opcode: Opcode::ControlAckV1,
-            key_id: self.key_id,
-            session_id: self.session_id,
-            acks,
-            peer_session_id,
-            packet_id: None,
-            payload: Vec::new(),
-        }
+        );
     }
 
     /// Update the state based on a packet from our peer.
@@ -140,70 +117,92 @@ impl ControlChannelState {
 #[cfg(test)]
 mod test {
     use super::ControlChannelState;
-    use crate::packets::{ControlChannelPacket, Opcode, Packet};
+    use crate::packets::{ControlChannelPacket, ControlChannelPacketBuffer, Opcode};
 
-    fn make_packet_with_id(id: u32) -> ControlChannelPacket {
-        ControlChannelPacket {
-            opcode: Opcode::ControlV1,
-            key_id: 0,
-            session_id: 0xf1f2f3f4f5f6f7f8,
-            acks: Vec::new(),
-            peer_session_id: Some(0x0102030405060708),
-            packet_id: Some(id),
-            payload: Vec::new(),
-        }
+    fn make_packet_with_id<'a>(
+        id: u32,
+        buffer: &'a mut ControlChannelPacketBuffer,
+    ) -> ControlChannelPacket<'a> {
+        buffer.write_header(
+            Opcode::ControlV1,
+            0,
+            0xf1f2f3f4f5f6f7f8,
+            &[0],
+            Some(0x0102030405060708),
+            Some(id),
+        );
+
+        ControlChannelPacket::parse(buffer.as_slice()).unwrap()
     }
 
     #[test]
     fn packet_channel_increments_packet_id() {
         let mut packet_channel = ControlChannelState::new(0x0102030405060708);
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        let mut buffer = ControlChannelPacketBuffer::with_payload_capacity(0);
+        let mut packet: ControlChannelPacket;
+
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(packet.packet_id, Some(0));
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(packet.packet_id, Some(1));
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(packet.packet_id, Some(2));
 
         packet_channel.next_packet_id = 23;
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(packet.packet_id, Some(23));
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(packet.packet_id, Some(24));
     }
 
     #[test]
     fn packet_channel_acks_packets() {
         let mut packet_channel = ControlChannelState::new(0x0102030405060708);
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        let mut buffer = ControlChannelPacketBuffer::with_payload_capacity(0);
+        let mut packet: ControlChannelPacket;
+
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(&packet.acks, &[]);
 
-        packet_channel.process_packet(&make_packet_with_id(0));
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.process_packet(&make_packet_with_id(0, &mut buffer));
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(&packet.acks, &[0]);
 
-        packet_channel.process_packet(&make_packet_with_id(1));
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.process_packet(&make_packet_with_id(1, &mut buffer));
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(&packet.acks, &[0, 1]);
 
-        packet_channel.process_packet(&make_packet_with_id(2));
-        packet_channel.process_packet(&make_packet_with_id(3));
-        packet_channel.process_packet(&make_packet_with_id(4));
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.process_packet(&make_packet_with_id(2, &mut buffer));
+        packet_channel.process_packet(&make_packet_with_id(3, &mut buffer));
+        packet_channel.process_packet(&make_packet_with_id(4, &mut buffer));
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(&packet.acks, &[1, 2, 3, 4]);
 
-        packet_channel.process_packet(&make_packet_with_id(5));
-        packet_channel.process_packet(&make_packet_with_id(6));
-        let packet = packet_channel.make_ack_packet();
+        packet_channel.process_packet(&make_packet_with_id(5, &mut buffer));
+        packet_channel.process_packet(&make_packet_with_id(6, &mut buffer));
+        packet_channel.fill_header(Opcode::ControlAckV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(&packet.acks, &[0, 1, 2, 3, 4, 5, 6]);
 
-        packet_channel.process_packet(&make_packet_with_id(7));
-        packet_channel.process_packet(&make_packet_with_id(8));
-        let packet = packet_channel.make_ack_packet();
+        packet_channel.process_packet(&make_packet_with_id(7, &mut buffer));
+        packet_channel.process_packet(&make_packet_with_id(8, &mut buffer));
+        packet_channel.fill_header(Opcode::ControlAckV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(&packet.acks, &[1, 2, 3, 4, 5, 6, 7, 8]);
 
-        packet_channel.process_packet(&make_packet_with_id(9));
-        packet_channel.process_packet(&make_packet_with_id(10));
-        let packet = packet_channel.make_packet(Opcode::ControlV1, Vec::new());
+        packet_channel.process_packet(&make_packet_with_id(9, &mut buffer));
+        packet_channel.process_packet(&make_packet_with_id(10, &mut buffer));
+        packet_channel.fill_header(Opcode::ControlV1, &mut buffer);
+        packet = ControlChannelPacket::parse(buffer.as_slice()).unwrap();
         assert_eq!(&packet.acks, &[7, 8, 9, 10]);
     }
 }

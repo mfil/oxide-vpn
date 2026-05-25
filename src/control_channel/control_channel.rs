@@ -19,7 +19,7 @@ use super::tls_record_stream::TlsRecordStream;
 
 use crate::data_channel::{DataChannelKeys, EpochKey};
 use crate::error::Error;
-use crate::packets::{ControlChannelPacket, Opcode};
+use crate::packets::{ControlChannelPacket, ControlChannelPacketBuffer, Opcode};
 
 #[derive(Debug)]
 enum TlsSession {
@@ -69,7 +69,7 @@ impl TlsSession {
 
     pub fn insert_payload(
         &mut self,
-        payload: Vec<u8>,
+        payload: &[u8],
     ) -> Result<(), HandshakeError<TlsRecordStream>> {
         let session = self.take();
 
@@ -93,7 +93,7 @@ impl TlsSession {
 
 /// OpenVPN Control Channel.
 #[derive(Debug)]
-pub struct ControlChannel<F: Fn(ControlChannelPacket)> {
+pub struct ControlChannel<F: Fn(ControlChannelPacketBuffer)> {
     state: ControlChannelState,
     is_server: bool,
     tls_session: TlsSession,
@@ -104,7 +104,7 @@ pub struct ControlChannel<F: Fn(ControlChannelPacket)> {
     send_callback: F,
 }
 
-impl<F: Fn(ControlChannelPacket)> ControlChannel<F> {
+impl<F: Fn(ControlChannelPacketBuffer)> ControlChannel<F> {
     /// Create new control channel.
     pub fn new<R: CryptoRng, S: ToString>(
         rng: &mut R,
@@ -177,17 +177,17 @@ impl<F: Fn(ControlChannelPacket)> ControlChannel<F> {
         Ok(())
     }
 
-    fn send_packet(&self, packet: ControlChannelPacket) {
+    fn send_packet(&self, packet: ControlChannelPacketBuffer) {
         (self.send_callback)(packet);
     }
 
     /// (Re-)initialize the control channel.
     pub fn reset(&mut self) {
         if !self.is_server {
-            let packet = self
-                .state
-                .make_packet(Opcode::ControlHardResetClientV2, Vec::new());
-            self.send_packet(packet);
+            let mut packet_buffer = ControlChannelPacketBuffer::with_payload_capacity(0);
+            self.state
+                .fill_header(Opcode::ControlHardResetClientV2, &mut packet_buffer);
+            self.send_packet(packet_buffer);
             self.tls_session = TlsSession::Uninitialized;
         }
     }
@@ -206,14 +206,16 @@ impl<F: Fn(ControlChannelPacket)> ControlChannel<F> {
 
         // Insert an ACK packet if the next regular packet can't hold all the acks that are pending.
         if self.state.unacked_packets() > 4 {
-            let ack_packet = self.state.make_ack_packet();
+            let mut ack_packet = ControlChannelPacketBuffer::with_payload_capacity(0);
+            self.state
+                .fill_header(Opcode::ControlAckV1, &mut ack_packet);
             self.send_packet(ack_packet);
         }
 
         if self.is_server && packet.opcode == Opcode::ControlHardResetClientV2 {
-            let packet = self
-                .state
-                .make_packet(Opcode::ControlHardResetServerV2, Vec::new());
+            let mut packet = ControlChannelPacketBuffer::with_payload_capacity(0);
+            self.state
+                .fill_header(Opcode::ControlHardResetServerV2, &mut packet);
             self.send_packet(packet);
             // TODO: Normal OpenVPN waits for the client to send the first ControlV1 packet
             // before establishing the session, to make DOS attacks harder. In the unlikely case
@@ -234,9 +236,10 @@ impl<F: Fn(ControlChannelPacket)> ControlChannel<F> {
         // TODO: Need to track if packets are acked and resend them if they're not acked after some
         // time.
         if let Some(tls_record_stream) = self.tls_session.get_tls_record_stream() {
-            for payload in tls_record_stream.get_written_records() {
-                let packet = self.state.make_packet(Opcode::ControlV1, payload);
-                self.send_packet(packet);
+            for mut packet_buffer in tls_record_stream.get_written_records() {
+                self.state
+                    .fill_header(Opcode::ControlV1, &mut packet_buffer);
+                self.send_packet(packet_buffer);
             }
         }
     }
@@ -268,7 +271,7 @@ impl<F: Fn(ControlChannelPacket)> ControlChannel<F> {
     }
 }
 
-impl<F: Fn(ControlChannelPacket)> Read for ControlChannel<F> {
+impl<F: Fn(ControlChannelPacketBuffer)> Read for ControlChannel<F> {
     /// Read data from the [`ControlChannel`]. If a handshake is in progress, this function will try
     /// to complete the handshake and then read data. It returns `WouldBlock` if a a handshake
     /// cannot be completed at this time.
@@ -296,7 +299,7 @@ impl<F: Fn(ControlChannelPacket)> Read for ControlChannel<F> {
     }
 }
 
-impl<F: Fn(ControlChannelPacket)> Write for ControlChannel<F> {
+impl<F: Fn(ControlChannelPacketBuffer)> Write for ControlChannel<F> {
     /// Write data to the [`ControlChannel`]. If a handshake is in progress, this function will try to
     /// complete the handshake and then send the data. It returns `WouldBlock` if a a handshake
     /// cannot be completed at this time.
@@ -338,7 +341,7 @@ impl<F: Fn(ControlChannelPacket)> Write for ControlChannel<F> {
 #[cfg(test)]
 mod test {
     use super::ControlChannel;
-    use crate::packets::{ControlChannelPacket, Opcode};
+    use crate::packets::{ControlChannelPacket, ControlChannelPacketBuffer, Opcode};
     use openssl;
     use openssl::x509::X509;
     use rand::rng;
@@ -405,7 +408,7 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         let ca_cert = X509::from_pem(CA_CERT).unwrap();
         let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
         let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
-        let outgoing_packets = RefCell::new(Vec::<ControlChannelPacket>::new());
+        let outgoing_packets = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
         let mut control_channel = ControlChannel::new(
             &mut rng(),
             false,
@@ -417,7 +420,8 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         );
         control_channel.reset();
 
-        let packet = outgoing_packets.borrow_mut().pop().unwrap();
+        let packet_buffer = outgoing_packets.borrow_mut().pop().unwrap();
+        let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
         assert_eq!(packet.opcode, Opcode::ControlHardResetClientV2);
         assert_eq!(packet.acks, &[]);
         assert_eq!(packet.payload, &[]);
@@ -430,7 +434,7 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         let server_key = openssl::pkey::PKey::private_key_from_pem(SERVER_KEY).unwrap();
         let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
         let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
-        let outgoing_packets_client = RefCell::new(Vec::<ControlChannelPacket>::new());
+        let outgoing_packets_client = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
         let mut client = ControlChannel::new(
             &mut rng(),
             false,
@@ -440,7 +444,7 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
             "Oxide VPN Test Server",
             |packet| outgoing_packets_client.borrow_mut().push(packet),
         );
-        let outgoing_packets_server = RefCell::new(Vec::<ControlChannelPacket>::new());
+        let outgoing_packets_server = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
         let mut server = ControlChannel::new(
             &mut rng(),
             true,
@@ -453,10 +457,12 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
 
         client.reset();
         while !client.is_connected() || !server.is_connected() {
-            for packet in outgoing_packets_client.borrow_mut().drain(..) {
+            for packet_buffer in outgoing_packets_client.borrow_mut().drain(..) {
+                let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
                 server.receive_packet(packet).unwrap();
             }
-            for packet in outgoing_packets_server.borrow_mut().drain(..) {
+            for packet_buffer in outgoing_packets_server.borrow_mut().drain(..) {
+                let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
                 client.receive_packet(packet).unwrap();
             }
         }
@@ -464,7 +470,8 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         let mut read_buffer: [u8; 2000] = [0; 2000];
         let message1 = b"Geht der nich noch?";
         client.write(message1).unwrap();
-        for packet in outgoing_packets_client.borrow_mut().drain(..) {
+        for packet_buffer in outgoing_packets_client.borrow_mut().drain(..) {
+            let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
             server.receive_packet(packet).unwrap();
         }
         let length = server.read(&mut read_buffer).unwrap();
@@ -472,7 +479,8 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
 
         let message2 = b"Der geht ja noch!";
         client.write(message2).unwrap();
-        for packet in outgoing_packets_client.borrow_mut().drain(..) {
+        for packet_buffer in outgoing_packets_client.borrow_mut().drain(..) {
+            let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
             server.receive_packet(packet).unwrap();
         }
         let length = server.read(&mut read_buffer).unwrap();
@@ -480,7 +488,8 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
 
         let message3 = b"Tut das Not dass der hier so rumoxidiert?";
         client.write(message3).unwrap();
-        for packet in outgoing_packets_client.borrow_mut().drain(..) {
+        for packet_buffer in outgoing_packets_client.borrow_mut().drain(..) {
+            let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
             server.receive_packet(packet).unwrap();
         }
         let length = server.read(&mut read_buffer).unwrap();
