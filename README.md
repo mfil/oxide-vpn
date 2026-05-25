@@ -12,5 +12,4 @@ there. For now, it "works" with the following caveats:
   on the server.
 * No support for renegotiation.
 * The user needs to set the IP address for the tun interface themselves.
-* Assumes that control channel packets are never dropped and arrive in order. Hey, it works on my
-  loopback interface!
+* Assumes that control channel packets it sends always arrive. Hey, it works on my veth interface!

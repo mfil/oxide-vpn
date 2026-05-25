@@ -71,6 +71,23 @@ impl PacketIdBuffer {
 }
 
 #[derive(Debug)]
+struct OutOfOrderPacket {
+    id: u32,
+    opcode: Opcode,
+    payload: Vec<u8>,
+}
+
+impl OutOfOrderPacket {
+    fn from_packet(packet: &ControlChannelPacket) -> Self {
+        OutOfOrderPacket {
+            id: packet.packet_id.unwrap(),
+            opcode: packet.opcode,
+            payload: packet.payload.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug)]
 enum TlsSession {
     Uninitialized,
     Handshake(MidHandshakeSslStream<TlsRecordStream>),
@@ -148,9 +165,13 @@ pub struct ControlChannel<F: Fn(ControlChannelPacketBuffer)> {
     session_id: u64,
     key_id: u8,
     peer_session_id: Option<u64>,
+    /// Buffer storing recently seen packet IDs from the peer, so we know which packets to ack.
     peer_packet_ids: PacketIdBuffer,
     /// Next packet ID we expect from the peer.
     next_packet_id_receive: u32,
+    /// Buffer for packets that arrived in the wrong order.
+    /// Contains tuples of Opcode, packet ID and payload. Sorted by packet ID in descending order.
+    out_of_order_packets: Vec<OutOfOrderPacket>,
 
     is_server: bool,
     tls_session: TlsSession,
@@ -179,6 +200,7 @@ impl<F: Fn(ControlChannelPacketBuffer)> ControlChannel<F> {
             peer_session_id: None,
             peer_packet_ids: PacketIdBuffer::new(),
             next_packet_id_receive: 0,
+            out_of_order_packets: Vec::new(),
             is_server,
             tls_session: TlsSession::Uninitialized,
             ca,
@@ -292,37 +314,73 @@ impl<F: Fn(ControlChannelPacketBuffer)> ControlChannel<F> {
         }
 
         if let Some(packet_id) = packet.packet_id {
-            if packet_id != self.next_packet_id_receive {
-                println!("Expected {} got {}", self.next_packet_id_receive, packet_id);
+            if packet_id < self.next_packet_id_receive {
+                // We already saw a packet with this ID. Most likely, the peer didn't receive our
+                // ACK in time. We will send another ACK for it with the next packet.
                 return Ok(());
-            } else {
-                self.next_packet_id_receive += 1;
-                println!("next_packet_id_receive = {}", self.next_packet_id_receive)
+            } else if packet_id > self.next_packet_id_receive {
+                // We are missing some packets in between this and the last one we received.
+                // Insert the packet into the out-of-order buffer.
+                // First, find the location where to insert it. The buffer is sorted in descending
+                // order of packet ID.
+                let mut index = 0;
+                for p in &self.out_of_order_packets {
+                    if p.id < packet_id {
+                        break;
+                    } else if p.id == packet_id {
+                        // We already received this packet before. Nothing to do!
+                        return Ok(());
+                    } else {
+                        index += 1;
+                    }
+                }
+                self.out_of_order_packets
+                    .insert(index, OutOfOrderPacket::from_packet(&packet));
+                return Ok(());
             }
-            if self.is_server && packet.opcode == Opcode::ControlHardResetClientV2 {
-                let mut packet = ControlChannelPacketBuffer::with_payload_capacity(0);
-                let acks = self.peer_packet_ids.ack(4);
-                packet.write_header(
-                    Opcode::ControlHardResetServerV2,
-                    self.key_id,
-                    self.session_id,
-                    acks,
-                    self.peer_session_id,
-                    Some(self.next_packet_id),
-                );
-                self.next_packet_id += 1;
-                self.send_packet(packet);
-                // TODO: Normal OpenVPN waits for the client to send the first ControlV1 packet
-                // before establishing the session, to make DOS attacks harder. In the unlikely case
-                // that anyone runs this for real, this should be fixed here.
-                self.begin_tls_handshake_server()?;
-            } else if !self.is_server && packet.opcode == Opcode::ControlHardResetServerV2 {
-                self.begin_tls_handshake_client()?;
-            } else if packet.opcode == Opcode::ControlV1 {
-                self.tls_session.insert_payload(packet.payload)?;
+
+            // If we're here, the packet ID is the one we expected next.
+            self.process_packet(packet.opcode, packet.payload)?;
+            self.next_packet_id_receive += 1;
+
+            // Check if we now can process some out-of-order packets that we received previously.
+            while let Some(packet) = self.out_of_order_packets.pop() {
+                if packet.id == self.next_packet_id_receive {
+                    self.process_packet(packet.opcode, &packet.payload)?;
+                    self.next_packet_id_receive += 1;
+                } else {
+                    self.out_of_order_packets.push(packet);
+                    break;
+                }
             }
         }
         self.send_packets();
+        Ok(())
+    }
+
+    pub fn process_packet(&mut self, opcode: Opcode, payload: &[u8]) -> Result<(), Error> {
+        if self.is_server && opcode == Opcode::ControlHardResetClientV2 {
+            let mut packet = ControlChannelPacketBuffer::with_payload_capacity(0);
+            let acks = self.peer_packet_ids.ack(4);
+            packet.write_header(
+                Opcode::ControlHardResetServerV2,
+                self.key_id,
+                self.session_id,
+                acks,
+                self.peer_session_id,
+                Some(self.next_packet_id),
+            );
+            self.next_packet_id += 1;
+            self.send_packet(packet);
+            // TODO: Normal OpenVPN waits for the client to send the first ControlV1 packet
+            // before establishing the session, to make DOS attacks harder. In the unlikely case
+            // that anyone runs this for real, this should be fixed here.
+            self.begin_tls_handshake_server()?;
+        } else if !self.is_server && opcode == Opcode::ControlHardResetServerV2 {
+            self.begin_tls_handshake_client()?;
+        } else if opcode == Opcode::ControlV1 {
+            self.tls_session.insert_payload(payload)?;
+        }
         Ok(())
     }
 
@@ -506,21 +564,41 @@ x1FLmZyk94KX8bfj/1xtAA==
 MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
 -----END PRIVATE KEY-----";
 
-    #[test]
-    fn control_channel_sends_reset() {
+    fn create_client<F: Fn(ControlChannelPacketBuffer)>(send_callback: F) -> ControlChannel<F> {
         let ca_cert = X509::from_pem(CA_CERT).unwrap();
         let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
         let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
-        let outgoing_packets = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
-        let mut control_channel = ControlChannel::new(
+        ControlChannel::new(
             &mut rng(),
             false,
             ca_cert,
             client_cert,
             client_key,
             "Oxide VPN Test Server",
-            |packet| outgoing_packets.borrow_mut().push(packet),
-        );
+            send_callback,
+        )
+    }
+
+    fn create_server<F: Fn(ControlChannelPacketBuffer)>(send_callback: F) -> ControlChannel<F> {
+        let ca_cert = X509::from_pem(CA_CERT).unwrap();
+        let server_cert = X509::from_pem(SERVER_CERT).unwrap();
+        let server_key = openssl::pkey::PKey::private_key_from_pem(SERVER_KEY).unwrap();
+        ControlChannel::new(
+            &mut rng(),
+            true,
+            ca_cert,
+            server_cert,
+            server_key,
+            "Oxide VPN Test Client",
+            send_callback,
+        )
+    }
+
+    #[test]
+    fn control_channel_sends_reset() {
+        let outgoing_packets = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
+        let mut control_channel =
+            create_client(|packet| outgoing_packets.borrow_mut().push(packet));
         control_channel.reset();
 
         let packet_buffer = outgoing_packets.borrow_mut().pop().unwrap();
@@ -532,31 +610,11 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
 
     #[test]
     fn control_channel_can_read_and_write() {
-        let ca_cert = X509::from_pem(CA_CERT).unwrap();
-        let server_cert = X509::from_pem(SERVER_CERT).unwrap();
-        let server_key = openssl::pkey::PKey::private_key_from_pem(SERVER_KEY).unwrap();
-        let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
-        let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
         let outgoing_packets_client = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
-        let mut client = ControlChannel::new(
-            &mut rng(),
-            false,
-            ca_cert.clone(),
-            client_cert,
-            client_key,
-            "Oxide VPN Test Server",
-            |packet| outgoing_packets_client.borrow_mut().push(packet),
-        );
+        let mut client = create_client(|packet| outgoing_packets_client.borrow_mut().push(packet));
+
         let outgoing_packets_server = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
-        let mut server = ControlChannel::new(
-            &mut rng(),
-            true,
-            ca_cert,
-            server_cert,
-            server_key,
-            "Oxide VPN Test Client",
-            |packet| outgoing_packets_server.borrow_mut().push(packet),
-        );
+        let mut server = create_server(|packet| outgoing_packets_server.borrow_mut().push(packet));
 
         client.reset();
         while !client.is_connected() || !server.is_connected() {
@@ -601,31 +659,11 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
 
     #[test]
     fn control_channel_ignores_duplicate_packets() {
-        let ca_cert = X509::from_pem(CA_CERT).unwrap();
-        let server_cert = X509::from_pem(SERVER_CERT).unwrap();
-        let server_key = openssl::pkey::PKey::private_key_from_pem(SERVER_KEY).unwrap();
-        let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
-        let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
         let outgoing_packets_client = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
-        let mut client = ControlChannel::new(
-            &mut rng(),
-            false,
-            ca_cert.clone(),
-            client_cert,
-            client_key,
-            "Oxide VPN Test Server",
-            |packet| outgoing_packets_client.borrow_mut().push(packet),
-        );
+        let mut client = create_client(|packet| outgoing_packets_client.borrow_mut().push(packet));
+
         let outgoing_packets_server = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
-        let mut server = ControlChannel::new(
-            &mut rng(),
-            true,
-            ca_cert,
-            server_cert,
-            server_key,
-            "Oxide VPN Test Client",
-            |packet| outgoing_packets_server.borrow_mut().push(packet),
-        );
+        let mut server = create_server(|packet| outgoing_packets_server.borrow_mut().push(packet));
 
         client.reset();
         // Client hard reset.
@@ -692,5 +730,44 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
             server.read(&mut read_buffer).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn control_channel_handles_out_of_order_packets() {
+        let outgoing_packets_client = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
+        let mut client = create_client(|packet| outgoing_packets_client.borrow_mut().push(packet));
+
+        let outgoing_packets_server = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
+        let mut server = create_server(|packet| outgoing_packets_server.borrow_mut().push(packet));
+
+        client.reset();
+
+        // Try to complete the handshake. If one peer sends multiple packets in a row, reverse
+        // the order.
+        while !client.is_connected() || !server.is_connected() {
+            for packet_buffer in outgoing_packets_client.borrow_mut().drain(..).rev() {
+                let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
+                server.receive_packet(packet).unwrap();
+            }
+            for packet_buffer in outgoing_packets_server.borrow_mut().drain(..).rev() {
+                let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
+                client.receive_packet(packet).unwrap();
+            }
+        }
+
+        client.write(b"Message 1").unwrap();
+        client.write(b"Message 2").unwrap();
+        client.write(b"Message 3").unwrap();
+        for packet_buffer in outgoing_packets_client.borrow_mut().drain(..).rev() {
+            let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
+            server.receive_packet(packet).unwrap();
+        }
+        let mut read_buffer: [u8; 1000] = [0; 1000];
+        let length = server.read(&mut read_buffer).unwrap();
+        assert_eq!(&read_buffer[..length], b"Message 1");
+        let length = server.read(&mut read_buffer).unwrap();
+        assert_eq!(&read_buffer[..length], b"Message 2");
+        let length = server.read(&mut read_buffer).unwrap();
+        assert_eq!(&read_buffer[..length], b"Message 3");
     }
 }
