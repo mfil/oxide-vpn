@@ -1,0 +1,8 @@
+client
+remote 192.168.24.2
+
+ca ca/ca.crt
+cert client/client.crt
+key client/client.key
+dev tun
+user openvpn

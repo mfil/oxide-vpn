@@ -1,0 +1,10 @@
+server 192.168.23.0 255.255.255.0
+topology subnet
+local 192.168.24.2
+
+disable-dco
+ca ca/ca.crt
+cert server/server.crt
+key server/server.key
+dev tun
+user openvpn
