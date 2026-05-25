@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::convert::From;
 use std::io;
 use std::io::{Read, Write};
@@ -14,12 +15,60 @@ use openssl::ssl::{
 };
 use openssl::x509::{X509, store::X509StoreBuilder};
 
-use super::control_channel_state::ControlChannelState;
 use super::tls_record_stream::TlsRecordStream;
 
 use crate::data_channel::{DataChannelKeys, EpochKey};
 use crate::error::Error;
 use crate::packets::{ControlChannelPacket, ControlChannelPacketBuffer, Opcode};
+
+/// Tracks packet IDs that we saw from the peer.
+#[derive(Debug)]
+struct PacketIdBuffer {
+    /// Packet IDs that have not yet been acked.
+    unacked_ids: Vec<u32>,
+    /// The (up to) eight most recent packet IDs for which we have sent acks. We can ack them again
+    /// to avoid unnecessary resends in case the packet with the original ack got lost. This is
+    /// recommended in the OpenVPN WIP RFC.
+    recent_packet_ids: [u32; 8],
+    /// How many elements of `recent_packet_id`s are actually in use.
+    recent_packet_ids_len: usize,
+}
+
+impl PacketIdBuffer {
+    pub fn new() -> Self {
+        Self {
+            unacked_ids: Vec::with_capacity(8),
+            recent_packet_ids: [0; 8],
+            recent_packet_ids_len: 0,
+        }
+    }
+
+    /// Returns up to `n` packet IDs to ack. IDs that have not been previously acked are
+    /// prioritized. The number is filled out with other recently seen packet IDs, if available.
+    /// All returned packet IDs are now considered acked by the [`PacketIdBuffer`].
+    pub fn ack(&mut self, n: usize) -> &[u32] {
+        let max_output_amount = min(n, 8);
+        let newly_acked_amount = min(self.unacked_ids.len(), max_output_amount);
+        let newly_acked_ids = &self.unacked_ids[..newly_acked_amount];
+
+        // Free up slots in recent_packet_ids for the newly acked IDs and copy them.
+        self.recent_packet_ids.copy_within(newly_acked_amount.., 0);
+        self.recent_packet_ids[8 - newly_acked_amount..].copy_from_slice(newly_acked_ids);
+        self.recent_packet_ids_len = min(8, self.recent_packet_ids_len + newly_acked_amount);
+
+        self.unacked_ids.copy_within(newly_acked_amount.., 0);
+        let remaining_unacked_amount = self.unacked_ids.len() - newly_acked_amount;
+        self.unacked_ids.truncate(remaining_unacked_amount);
+
+        let slice_start = 8 - min(self.recent_packet_ids_len, max_output_amount);
+        &self.recent_packet_ids[slice_start..]
+    }
+
+    /// Returns how many packets have not been acked at least once.
+    pub fn unacked_packet_count(&self) -> usize {
+        self.unacked_ids.len()
+    }
+}
 
 #[derive(Debug)]
 enum TlsSession {
@@ -94,7 +143,15 @@ impl TlsSession {
 /// OpenVPN Control Channel.
 #[derive(Debug)]
 pub struct ControlChannel<F: Fn(ControlChannelPacketBuffer)> {
-    state: ControlChannelState,
+    /// Next packet ID we will send.
+    next_packet_id: u32,
+    session_id: u64,
+    key_id: u8,
+    peer_session_id: Option<u64>,
+    peer_packet_ids: PacketIdBuffer,
+    /// Next packet ID we expect from the peer.
+    next_packet_id_receive: u32,
+
     is_server: bool,
     tls_session: TlsSession,
     ca: X509,
@@ -116,7 +173,12 @@ impl<F: Fn(ControlChannelPacketBuffer)> ControlChannel<F> {
         send_callback: F,
     ) -> Self {
         ControlChannel {
-            state: ControlChannelState::new(rng.next_u64()),
+            next_packet_id: 0,
+            session_id: rng.next_u64(),
+            key_id: 0,
+            peer_session_id: None,
+            peer_packet_ids: PacketIdBuffer::new(),
+            next_packet_id_receive: 0,
             is_server,
             tls_session: TlsSession::Uninitialized,
             ca,
@@ -185,8 +247,15 @@ impl<F: Fn(ControlChannelPacketBuffer)> ControlChannel<F> {
     pub fn reset(&mut self) {
         if !self.is_server {
             let mut packet_buffer = ControlChannelPacketBuffer::with_payload_capacity(0);
-            self.state
-                .fill_header(Opcode::ControlHardResetClientV2, &mut packet_buffer);
+            packet_buffer.write_header(
+                Opcode::ControlHardResetClientV2,
+                self.key_id,
+                self.session_id,
+                &[],
+                None,
+                Some(self.next_packet_id),
+            );
+            self.next_packet_id += 1;
             self.send_packet(packet_buffer);
             self.tls_session = TlsSession::Uninitialized;
         }
@@ -202,30 +271,56 @@ impl<F: Fn(ControlChannelPacketBuffer)> ControlChannel<F> {
     /// If many packets are received without sending one, this method may also send out ACK packets.
     pub fn receive_packet(&mut self, packet: ControlChannelPacket) -> Result<(), Error> {
         // TODO: Need to handle out of order packets.
-        self.state.process_packet(&packet);
+        self.peer_session_id = Some(packet.session_id);
+        if let Some(packet_id) = packet.packet_id {
+            self.peer_packet_ids.unacked_ids.push(packet_id);
+        }
 
         // Insert an ACK packet if the next regular packet can't hold all the acks that are pending.
-        if self.state.unacked_packets() > 4 {
+        if self.peer_packet_ids.unacked_packet_count() > 4 {
             let mut ack_packet = ControlChannelPacketBuffer::with_payload_capacity(0);
-            self.state
-                .fill_header(Opcode::ControlAckV1, &mut ack_packet);
+            let acks = self.peer_packet_ids.ack(8);
+            ack_packet.write_header(
+                Opcode::ControlAckV1,
+                self.key_id,
+                self.session_id,
+                acks,
+                self.peer_session_id,
+                None,
+            );
             self.send_packet(ack_packet);
         }
 
-        if self.is_server && packet.opcode == Opcode::ControlHardResetClientV2 {
-            let mut packet = ControlChannelPacketBuffer::with_payload_capacity(0);
-            self.state
-                .fill_header(Opcode::ControlHardResetServerV2, &mut packet);
-            self.send_packet(packet);
-            // TODO: Normal OpenVPN waits for the client to send the first ControlV1 packet
-            // before establishing the session, to make DOS attacks harder. In the unlikely case
-            // that anyone runs this for real, this should be fixed here.
-            self.begin_tls_handshake_server()?;
-        } else if !self.is_server && packet.opcode == Opcode::ControlHardResetServerV2 {
-            self.begin_tls_handshake_client()?;
-        } else if packet.opcode == Opcode::ControlV1 {
-            self.tls_session.insert_payload(packet.payload)?;
-        } else if packet.opcode == Opcode::ControlAckV1 {
+        if let Some(packet_id) = packet.packet_id {
+            if packet_id != self.next_packet_id_receive {
+                println!("Expected {} got {}", self.next_packet_id_receive, packet_id);
+                return Ok(());
+            } else {
+                self.next_packet_id_receive += 1;
+                println!("next_packet_id_receive = {}", self.next_packet_id_receive)
+            }
+            if self.is_server && packet.opcode == Opcode::ControlHardResetClientV2 {
+                let mut packet = ControlChannelPacketBuffer::with_payload_capacity(0);
+                let acks = self.peer_packet_ids.ack(4);
+                packet.write_header(
+                    Opcode::ControlHardResetServerV2,
+                    self.key_id,
+                    self.session_id,
+                    acks,
+                    self.peer_session_id,
+                    Some(self.next_packet_id),
+                );
+                self.next_packet_id += 1;
+                self.send_packet(packet);
+                // TODO: Normal OpenVPN waits for the client to send the first ControlV1 packet
+                // before establishing the session, to make DOS attacks harder. In the unlikely case
+                // that anyone runs this for real, this should be fixed here.
+                self.begin_tls_handshake_server()?;
+            } else if !self.is_server && packet.opcode == Opcode::ControlHardResetServerV2 {
+                self.begin_tls_handshake_client()?;
+            } else if packet.opcode == Opcode::ControlV1 {
+                self.tls_session.insert_payload(packet.payload)?;
+            }
         }
         self.send_packets();
         Ok(())
@@ -237,8 +332,16 @@ impl<F: Fn(ControlChannelPacketBuffer)> ControlChannel<F> {
         // time.
         if let Some(tls_record_stream) = self.tls_session.get_tls_record_stream() {
             for mut packet_buffer in tls_record_stream.get_written_records() {
-                self.state
-                    .fill_header(Opcode::ControlV1, &mut packet_buffer);
+                let acks = self.peer_packet_ids.ack(4);
+                packet_buffer.write_header(
+                    Opcode::ControlV1,
+                    self.key_id,
+                    self.session_id,
+                    acks,
+                    self.peer_session_id,
+                    Some(self.next_packet_id),
+                );
+                self.next_packet_id += 1;
                 self.send_packet(packet_buffer);
             }
         }
@@ -494,5 +597,100 @@ MC4CAQAwBQYDK2VwBCIEIPoLkAE/xkDbkwg7Qarhru2ykSodlmZ9H+fm66ZUTE7V
         }
         let length = server.read(&mut read_buffer).unwrap();
         assert_eq!(message3, &read_buffer[..length]);
+    }
+
+    #[test]
+    fn control_channel_ignores_duplicate_packets() {
+        let ca_cert = X509::from_pem(CA_CERT).unwrap();
+        let server_cert = X509::from_pem(SERVER_CERT).unwrap();
+        let server_key = openssl::pkey::PKey::private_key_from_pem(SERVER_KEY).unwrap();
+        let client_cert = X509::from_pem(CLIENT_CERT).unwrap();
+        let client_key = openssl::pkey::PKey::private_key_from_pem(CLIENT_KEY).unwrap();
+        let outgoing_packets_client = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
+        let mut client = ControlChannel::new(
+            &mut rng(),
+            false,
+            ca_cert.clone(),
+            client_cert,
+            client_key,
+            "Oxide VPN Test Server",
+            |packet| outgoing_packets_client.borrow_mut().push(packet),
+        );
+        let outgoing_packets_server = RefCell::new(Vec::<ControlChannelPacketBuffer>::new());
+        let mut server = ControlChannel::new(
+            &mut rng(),
+            true,
+            ca_cert,
+            server_cert,
+            server_key,
+            "Oxide VPN Test Client",
+            |packet| outgoing_packets_server.borrow_mut().push(packet),
+        );
+
+        client.reset();
+        // Client hard reset.
+        let packet1 = outgoing_packets_client.borrow_mut().pop().unwrap();
+        server
+            .receive_packet(ControlChannelPacket::parse(packet1.as_slice()).unwrap())
+            .unwrap();
+        // Server hard reset.
+        let packet2 = outgoing_packets_server.borrow_mut().pop().unwrap();
+        client
+            .receive_packet(ControlChannelPacket::parse(packet2.as_slice()).unwrap())
+            .unwrap();
+        // First TLS handshake packet (client -> server).
+        let packet3 = outgoing_packets_client.borrow_mut().pop().unwrap();
+        server
+            .receive_packet(ControlChannelPacket::parse(packet3.as_slice()).unwrap())
+            .unwrap();
+        // First TLS handshake packet (server -> cient).
+        let packet4 = outgoing_packets_server.borrow_mut().remove(0);
+        client
+            .receive_packet(ControlChannelPacket::parse(packet4.as_slice()).unwrap())
+            .unwrap();
+        // Receive duplicate of the previous packet.
+        client
+            .receive_packet(ControlChannelPacket::parse(packet4.as_slice()).unwrap())
+            .unwrap();
+
+        // Try to complete the handshake.
+        while !client.is_connected() || !server.is_connected() {
+            for packet_buffer in outgoing_packets_client.borrow_mut().drain(..) {
+                let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
+                server.receive_packet(packet).unwrap();
+            }
+            for packet_buffer in outgoing_packets_server.borrow_mut().drain(..) {
+                let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
+                client.receive_packet(packet).unwrap();
+            }
+        }
+
+        // Resend the server hard reset packet.
+        client
+            .receive_packet(ControlChannelPacket::parse(packet2.as_slice()).unwrap())
+            .unwrap();
+
+        // Send the first handshake packet again.
+        client
+            .receive_packet(ControlChannelPacket::parse(packet4.as_slice()).unwrap())
+            .unwrap();
+
+        // Send a message twice.
+        client.write(b"Duplicate packet test").unwrap();
+        for packet_buffer in outgoing_packets_client.borrow_mut().drain(..) {
+            // Send the message twice.
+            let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
+            server.receive_packet(packet).unwrap();
+            let packet = ControlChannelPacket::parse(packet_buffer.as_slice()).unwrap();
+            server.receive_packet(packet).unwrap();
+        }
+
+        let mut read_buffer: [u8; 1000] = [0; 1000];
+        let length = server.read(&mut read_buffer).unwrap();
+        assert_eq!(&read_buffer[..length], b"Duplicate packet test");
+        assert_eq!(
+            server.read(&mut read_buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }
