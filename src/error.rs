@@ -10,6 +10,7 @@ pub enum Error {
     PermissionDenied(String),
     Handshake(String),
     Retry(String),
+    ControlChannelNotReady,
     BufferTooSmall,
     Io(io::Error),
     Ssl(openssl::error::ErrorStack),
@@ -24,6 +25,10 @@ impl fmt::Display for Error {
             Error::PermissionDenied(s) => write!(formatter, "Permission denied: {}", s),
             Error::Handshake(s) => write!(formatter, "Handshake failed: {}", s),
             Error::Retry(s) => write!(formatter, "Temporary error: {}", s),
+            Error::ControlChannelNotReady => write!(
+                formatter,
+                "Control channel cannot derive data channel keys."
+            ),
             Error::BufferTooSmall => write!(formatter, "Buffer too small"),
             Error::Io(e) => write!(formatter, "IO Error: {}", e),
             Error::Ssl(e) => write!(formatter, "OpenSSL Error: {}", e),

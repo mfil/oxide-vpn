@@ -8,6 +8,7 @@ extern crate rand;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::UdpSocket;
+use std::time::Instant;
 
 use clap::Parser;
 use openssl::pkey::PKey;
@@ -19,7 +20,6 @@ mod data_channel;
 mod error;
 mod packets;
 mod poll;
-mod retransmit;
 mod tun;
 
 use control_channel::ControlChannel;
@@ -99,9 +99,6 @@ fn main() -> Result<(), Error> {
         X509::from_pem(&cert_pem)?,
         PKey::private_key_from_pem(&key_pem)?,
         args.peer_name,
-        |packet| {
-            socket.send(packet.as_slice()).unwrap();
-        },
     );
     let mut data_channel: Option<DataChannel> = None;
 
@@ -113,8 +110,8 @@ fn main() -> Result<(), Error> {
     let mut write_buffer = [0u8; 3000];
 
     control_channel.reset();
-    control_channel.send_packets();
     socket.set_nonblocking(true)?;
+    control_channel.send(Instant::now(), &mut |data| socket.send(data))?;
 
     loop {
         let poll_result = poller.poll(-1, true)?;
@@ -134,16 +131,12 @@ fn main() -> Result<(), Error> {
             }
         }
 
-        if poll_result.can_read_tun {
-            if let Some(data_channel) = &mut data_channel {
-                let mut data_packet_buffer = packet_buffer.read_data_channel_plaintext(&mut tun)?;
-                data_channel.encrypt_packet(&mut data_packet_buffer)?;
-                socket.send(data_packet_buffer.as_slice())?;
-            } else {
-                println!(
-                    "tun interface received packets before the data channel is ready, ignoring."
-                );
-            }
+        if poll_result.can_read_tun
+            && let Some(data_channel) = &mut data_channel
+        {
+            let mut data_packet_buffer = packet_buffer.read_data_channel_plaintext(&mut tun)?;
+            data_channel.encrypt_packet(&mut data_packet_buffer)?;
+            socket.send(data_packet_buffer.as_slice())?;
         }
 
         if state == ConnectionState::Uninitialized {
@@ -178,7 +171,7 @@ fn main() -> Result<(), Error> {
                         println!("Peer does not support aead-epoch.");
                         break;
                     }
-                    if let Some(keys) = control_channel.derive_data_channel_keys() {
+                    if let Ok(keys) = control_channel.derive_data_channel_keys() {
                         data_channel = Some(DataChannel::new(
                             push_reply.peer_id,
                             AES_256_GCM,
@@ -192,7 +185,7 @@ fn main() -> Result<(), Error> {
         }
 
         // Try to send packets.
-        control_channel.send_packets();
+        control_channel.send(Instant::now(), &mut |data| socket.send(data))?;
     }
     Ok(())
 }
