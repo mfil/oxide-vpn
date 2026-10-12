@@ -6,7 +6,7 @@ extern crate openssl;
 extern crate rand;
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::UdpSocket;
 use std::time::Instant;
 
@@ -113,17 +113,49 @@ fn main() -> Result<(), Error> {
     socket.set_nonblocking(true)?;
     control_channel.send(Instant::now(), &mut |data| socket.send(data))?;
 
+    let mut pending_decrypted_packet: Option<Vec<u8>> = None;
+
     loop {
         let poll_result = poller.poll(-1, true)?;
 
-        if poll_result.can_read_network {
+        if poll_result.can_write_tun
+            && let Some(decrypted_packet) = pending_decrypted_packet.take()
+        {
+            match tun.write(&decrypted_packet) {
+                Ok(_) => {
+                    poller.set_want_write_tun(false);
+                }
+                Err(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        poller.set_want_write_tun(true);
+                        pending_decrypted_packet = Some(decrypted_packet);
+                    } else {
+                        return Err(Error::from(e));
+                    }
+                }
+            }
+        }
+
+        if poll_result.can_read_network && pending_decrypted_packet.is_none() {
             let packet = packet_buffer.recv_packet(&socket)?;
             match packet {
                 Packet::Control(p) => control_channel.receive_packet(p)?,
                 Packet::Data(p) => {
                     if let Some(data_channel) = &mut data_channel {
                         let decrypted_packet = data_channel.decrypt_packet(p)?;
-                        tun.write(&decrypted_packet)?;
+                        match tun.write(&decrypted_packet) {
+                            Ok(_) => {
+                                poller.set_want_write_tun(false);
+                            }
+                            Err(e) => {
+                                if e.kind() == ErrorKind::WouldBlock {
+                                    poller.set_want_write_tun(true);
+                                    pending_decrypted_packet = Some(decrypted_packet.to_vec());
+                                } else {
+                                    return Err(Error::from(e));
+                                }
+                            }
+                        }
                     } else {
                         println!("Received data channel packet before it is ready, ignoring.");
                     }
@@ -134,9 +166,22 @@ fn main() -> Result<(), Error> {
         if poll_result.can_read_tun
             && let Some(data_channel) = &mut data_channel
         {
-            let mut data_packet_buffer = packet_buffer.read_data_channel_plaintext(&mut tun)?;
-            data_channel.encrypt_packet(&mut data_packet_buffer)?;
-            socket.send(data_packet_buffer.as_slice())?;
+            match packet_buffer.read_data_channel_plaintext(&mut tun) {
+                Ok(mut data_packet_buffer) => {
+                    data_channel.encrypt_packet(&mut data_packet_buffer)?;
+                    socket.send(data_packet_buffer.as_slice())?;
+                }
+                Err(Error::Io(e)) => {
+                    // It is possible that we get a WouldBlock error, even though poll told us that
+                    // we can read. So check if this is an actual error before returning it.
+                    if e.kind() != ErrorKind::WouldBlock {
+                        return Err(Error::Io(e));
+                    }
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
 
         if state == ConnectionState::Uninitialized {
