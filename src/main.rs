@@ -6,11 +6,13 @@ extern crate openssl;
 extern crate rand;
 
 use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
+use std::mem::min_align_of_val;
 use std::net::UdpSocket;
 use std::time::Instant;
 
 use clap::Parser;
+use libc::{IFLA_INFO_XSTATS, NETLINK_FIB_LOOKUP};
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 use rand::rng;
@@ -23,13 +25,10 @@ mod poll;
 mod tun;
 
 use control_channel::ControlChannel;
-use control_channel::messages::{IvProto, PeerInfo};
+use control_channel::messages::{IvProto, PeerInfo, PushReply};
 use data_channel::{AES_256_GCM, DataChannel};
-use error::Error;
-use packets::Packet;
-
-use crate::control_channel::messages::PushReply;
-use crate::packets::PacketBuffer;
+use error::{Error, catch_would_block};
+use packets::{Packet, PacketBuffer};
 
 #[derive(Parser)]
 #[clap(name = "OxideVPN", version = "0.1.0", author = "Max Fillinger")]
@@ -113,53 +112,23 @@ fn main() -> Result<(), Error> {
     socket.set_nonblocking(true)?;
     control_channel.send(Instant::now(), &mut |data| socket.send(data))?;
 
-    let mut pending_decrypted_packet: Option<Vec<u8>> = None;
-
     loop {
         let poll_result = poller.poll(-1, true)?;
 
-        if poll_result.can_write_tun
-            && let Some(decrypted_packet) = pending_decrypted_packet.take()
-        {
-            match tun.write(&decrypted_packet) {
-                Ok(_) => {
-                    poller.set_want_write_tun(false);
-                }
-                Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        poller.set_want_write_tun(true);
-                        pending_decrypted_packet = Some(decrypted_packet);
-                    } else {
-                        return Err(Error::from(e));
-                    }
-                }
-            }
-        }
-
-        if poll_result.can_read_network && pending_decrypted_packet.is_none() {
-            let packet = packet_buffer.recv_packet(&socket)?;
-            match packet {
-                Packet::Control(p) => control_channel.receive_packet(p)?,
-                Packet::Data(p) => {
+        if poll_result.can_read_network {
+            match packet_buffer.recv_packet(&socket) {
+                Ok(Packet::Control(p)) => control_channel.receive_packet(p)?,
+                Ok(Packet::Data(p)) => {
                     if let Some(data_channel) = &mut data_channel {
                         let decrypted_packet = data_channel.decrypt_packet(p)?;
-                        match tun.write(&decrypted_packet) {
-                            Ok(_) => {
-                                poller.set_want_write_tun(false);
-                            }
-                            Err(e) => {
-                                if e.kind() == ErrorKind::WouldBlock {
-                                    poller.set_want_write_tun(true);
-                                    pending_decrypted_packet = Some(decrypted_packet.to_vec());
-                                } else {
-                                    return Err(Error::from(e));
-                                }
-                            }
+                        if let Err(e) = tun.write(&decrypted_packet) {
+                            catch_would_block(e)?;
                         }
                     } else {
                         println!("Received data channel packet before it is ready, ignoring.");
                     }
                 }
+                Err(e) => catch_would_block(e)?,
             }
         }
 
@@ -169,17 +138,14 @@ fn main() -> Result<(), Error> {
             match packet_buffer.read_data_channel_plaintext(&mut tun) {
                 Ok(mut data_packet_buffer) => {
                     data_channel.encrypt_packet(&mut data_packet_buffer)?;
-                    socket.send(data_packet_buffer.as_slice())?;
-                }
-                Err(Error::Io(e)) => {
-                    // It is possible that we get a WouldBlock error, even though poll told us that
-                    // we can read. So check if this is an actual error before returning it.
-                    if e.kind() != ErrorKind::WouldBlock {
-                        return Err(Error::Io(e));
+                    if let Err(e) = socket.send(data_packet_buffer.as_slice()) {
+                        catch_would_block(e)?;
                     }
                 }
                 Err(e) => {
-                    return Err(e);
+                    // It is possible that we get a WouldBlock error, even though poll told us that
+                    // we can read. So check if this is an actual error before returning it.
+                    catch_would_block(e)?;
                 }
             }
         }
@@ -230,7 +196,10 @@ fn main() -> Result<(), Error> {
         }
 
         // Try to send packets.
-        control_channel.send(Instant::now(), &mut |data| socket.send(data))?;
+        let send_result = control_channel.send(Instant::now(), &mut |data| socket.send(data));
+        if let Err(e) = send_result {
+            catch_would_block(e)?;
+        }
     }
     Ok(())
 }

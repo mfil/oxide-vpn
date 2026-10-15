@@ -74,3 +74,17 @@ impl<T: fmt::Debug> From<openssl::ssl::HandshakeError<T>> for Error {
         Error::Handshake(format!("{}", error))
     }
 }
+
+/// Returns `Ok` if `error` is of kind `WouldBlock` and else returns `Err(error)`.
+pub fn catch_would_block<E: Into<Error>>(error: E) -> Result<(), Error> {
+    match error.into() {
+        Error::Io(io_error) => {
+            if io_error.kind() == io::ErrorKind::WouldBlock {
+                Ok(())
+            } else {
+                Err(io_error.into())
+            }
+        }
+        default => Err(default),
+    }
+}
